@@ -1,0 +1,25 @@
+[
+  {
+    "id": "eml-003",
+    "title": "新客户初次开发信-激光美容设备推荐",
+    "content": "Dear XX Team,\n\nI've followed XX's growth since your IPO — a listed group running PicoWay, PicoCure, Thermage FLX, Ultherapy Prime, Onda, Oligio X and EndyMed across 20+ centers in Hong Kong, Macau, mainland China, Australia and Singapore. That's a serious commitment to original OEM units.\n\nLooking at your menu, your energy-based work is strong on picosecond lasers, RF tightening and body contouring. One area where we see groups like yours occasionally consider a dedicated mid-tier workhorse is hair removal — your current laser hair removal likely runs on Alexandrite or IPL. A triple-wavelength diode (755/808/1064nm) with sapphire cooling gives better results on Fitzpatrick IV–V skin, which is common among your Hong Kong and Southeast Asian clients. That's our D-100.\n\nTwo other units that may fit as second-room options:\n\nK2 — BroadBand Light for photofacial, redness and shallow pigment\n\nQ7 — Q-Switched Nd:YAG (1064/532nm) for deeper pigmented lesions and tattoo removal\n\nWe're not asking XX to replace your flagship brands — just leaving the spec sheets with your purchasing team in case there's a fit for a second-room unit or a refresh cycle.\n\nHappy to send:\n\nS500 / IPL-200 / NDYAG-300 specification sheets\n\nShort operation videos (handpiece, screen flow, cooling tip)\n\nIf it's useful, keep them on file. If not, no follow-up needed.\n\nBest regards,\n\nDemo User\n\nDemoMed – Medical Aesthetic Equipment\n\nWhatsApp: +00 000 000 0000\n\nEmail: contact@example.com\n\nWeb: www.example.com",
+    "source": "frontend",
+    "tags": [
+      "邮件",
+      "开发信",
+      "新客户",
+      "激光美容设备",
+      "专业"
+    ]
+  },
+  {
+    "id": "eml-004",
+    "title": "Dear XXX Team",
+    "content": "**Dear XXX Team,**\n\nI've followed XXXs growth since your IPO — a listed group running **PicoWay, PicoCure, Thermage FLX, Ultherapy Prime, Onda, Oligio X and EndyMed**​ across 20+ centers in Hong Kong, Macau, mainland China, Australia and Singapore. That's a serious commitment to original OEM units.\n\nLooking at your menu, your energy-based work is strong on picosecond lasers, RF tightening and body contouring. One area where we see groups like yours occasionally consider a dedicated mid-tier workhorse is **hair removal**​ — your current laser hair removal likely runs on Alexandrite or IPL. A **triple-wavelength diode (755/808/1064nm) with sapphire cooling**​ gives better results on Fitzpatrick IV–V skin, which is common among your Hong Kong and Southeast Asian clients. That's our **D-100**.\n\nTwo other units that may fit as second-room options:\n\n**IPL-200**​ — BroadBand Light for photofacial, redness and shallow pigment\n\n**NDYAG-300**​ — Q-Switched Nd:YAG (1064/532nm) for deeper pigmented lesions and tattoo removal\n\nWe're not asking Example Clinic Group to replace your flagship brands — just leaving the spec sheets with your purchasing team in case there's a fit for a second-room unit or a refresh cycle.\n\nHappy to send:\n\nS500 / IPL-200 / NDYAG-300 specification sheets\n\nShort operation videos (handpiece, screen flow, cooling tip)\n\nIf it's useful, keep them on file. If not, no follow-up needed.\n\nBest regards,\n\n**Demo User**\n\nDemoMed – Medical Aesthetic Equipment\n\nWhatsApp: +00 000 000 0000\n\nEmail: contact@example.com\n\nWeb: [www.example.com](http://www.example.com\" \\t \"_blank)",
+    "source": "frontend",
+    "tags": [
+      "邮件",
+      "模板"
+    ]
+  }
+]

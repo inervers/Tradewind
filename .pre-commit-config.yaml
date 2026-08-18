@@ -1,0 +1,29 @@
+# Secrets Guard: run before every commit.
+# Setup: python -m pip install pre-commit detect-secrets
+# Install hook: pre-commit install
+# Full scan: pre-commit run detect-secrets --all-files
+
+repos:
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        exclude: >
+          (?x)^(
+            package-lock\.json|
+            Cargo\.lock|
+            poetry\.lock|
+            Pipfile\.lock|
+            yarn\.lock|
+            .*\.(svg|png|jpg|jpeg|gif|ico|woff|woff2|ttf|eot)$
+          )$
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+        args: ["--fix=lf"]

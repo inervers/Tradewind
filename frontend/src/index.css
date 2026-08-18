@@ -1,0 +1,38 @@
+:root {
+  --bg: #0b0e14;
+  --bg-card: #131722;
+  --bg-input: #0f131c;
+  --border: #232a3a;
+  --text: #e6e9f0;
+  --text-dim: #8b93a7;
+  --accent: #2dd4bf;
+  --accent-dim: #14b8a6;
+  --danger: #f87171;
+  --ok: #4ade80;
+  --radius: 10px;
+  --font: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+}
+
+input {
+  font-family: inherit;
+}

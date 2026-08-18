@@ -1,0 +1,59 @@
+# 敏感数据（客户名单/邮箱，绝不入库）
+data/customers*.csv
+data/customers*.json
+data/maps_*.csv
+data/*.csv
+data/raw/
+data/*.db
+data/*.png
+
+# 运行时配置（含 API Key，绝不入库）
+data/config.json
+
+# 环境
+.env
+.env.*
+!.env.example
+!frontend/.env.desktop
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+credentials.*
+.secrets
+.secrets.*
+!.secrets.baseline
+__pycache__/
+*.pyc
+node_modules/
+.test-deps/
+
+# 本地 Agent 工作材料（不属于公开源码）
+.agents/
+docs/codex-prompt-*.md
+
+# 输出
+outputs/
+
+# 构建产物（前端 vite + PyInstaller）
+frontend/dist/
+dist/
+build/
+*.spec
+!TradewindBackend.spec
+!Tradewind.spec
+frontend/src-tauri/binaries/*.exe
+
+# 运行时诊断与导入中间件
+data/ocr_errors.log
+data/crawler_errors.log
+data/crawler_seen.json
+data/crawler_photos/
+data/photo_scan/
+data/server-*.log
+data/pdf_import/
+data/maps_diag.png
+data/treatwell_diag.png
