@@ -125,6 +125,9 @@ npm run build:check
 ```powershell
 # 构建前端并生成免安装目录
 powershell -ExecutionPolicy Bypass -File scripts/build-portable.ps1
+
+# 一次完成安全扫描、测试、评测、构建、校验与解压 smoke
+powershell -ExecutionPolicy Bypass -File scripts/run-minimum-release.ps1
 ```
 
 构建结果包括 `dist/Tradewind-Portable/` 免安装目录、带日期版本号的 ZIP 和对应
@@ -142,6 +145,8 @@ powershell -ExecutionPolicy Bypass -File scripts/test-portable.ps1
 - 爬虫复用用户电脑上的 Microsoft Edge 或 Google Chrome，不额外捆绑浏览器。
 - 浏览器绿色版与 Tauri 桌面端是两条独立构建链，执行本脚本不会重建桌面 sidecar。
 - 设置页可由用户主动导出脱敏诊断包；软件不做后台遥测，不上传 Key、客户内容、邮件、照片或原始日志。
+- `2026.09.14-min` 已在一台独立 Windows 11 家庭版中文 x64（build 26200）电脑完成 ZIP/EXE/测试脚本哈希校验、解压 smoke、浏览器界面、重复启动与进程清理验收；对应源码提交为 `67d3907`。
+- 目标电脑可检测到 Python 命令，因此该证据只表述为“独立 Windows 电脑验收”，不夸大为“无 Python 环境”；Tauri 不在本轮验收范围内。
 
 ### Tauri 桌面开发
 
@@ -196,8 +201,9 @@ pre-commit install
 pre-commit run detect-secrets --all-files
 ```
 
-评测夹具位于 `eval/fixtures/`，只使用合成数据。便携版发布还应运行
-`scripts/test-portable.ps1`，并在干净 Windows 环境中完成一次人工验收。
+评测夹具位于 `eval/fixtures/`，只使用合成数据。便携版发布由
+`scripts/run-minimum-release.ps1` 统一执行安全扫描、测试、评测、构建、哈希校验与
+解压 smoke；`2026.09.14-min` 已在独立 Windows 11 x64 电脑完成人工界面验收。
 
 ## 爬虫视觉识别（缺品分析）
 
@@ -251,7 +257,8 @@ Tradewind/
 - [x] 照片视觉识别 + 缺品分析（智谱 / 火山豆包 / OpenAI）
 - [x] 话术模板 Tab / 文档 OCR 导入 / 多服务商 / 流式 + 真后台取消
 - [x] Tauri 桌面壳（单实例、后端自启、启动画面、AppLocalData 数据目录）
-- [ ] 生成正式安装包并完成干净 Windows 环境验收
+- [x] 生成 Browser Portable ZIP 并完成独立 Windows 11 x64 环境验收
+- [ ] 生成 Tauri 正式安装包并完成独立 Windows 环境验收（当前范围外）
 - [ ] 用户侧私有资料导入验收（仅保存在本机，测试材料先脱敏）
 - [ ] 发信闭环（SMTP 发送 + 已发/未发/已回跟进状态）——获客最后一公里
 - [ ] 跨区域批量采集与反爬稳定性验证
