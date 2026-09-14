@@ -6,6 +6,30 @@ param(
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
+function Invoke-NativeBuildStep {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 turns native stderr (including npm notices
+        # and PyInstaller progress) into ErrorRecord objects. The process exit
+        # code is the reliable success contract for these native build tools.
+        $ErrorActionPreference = "Continue"
+        & $Action
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($exitCode -ne 0) {
+        throw "$Description failed with exit code $exitCode"
+    }
+}
+
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $pythonCandidates = @(
     $env:TRADEWIND_PYTHON,
@@ -28,9 +52,8 @@ $checksumPath = "$archivePath.sha256.txt"
 if (-not $PackageOnly) {
     Push-Location $frontendDir
     try {
-        & npm run build:check
-        if ($LASTEXITCODE -ne 0) {
-            throw "Frontend build failed with exit code $LASTEXITCODE"
+        Invoke-NativeBuildStep -Description "Frontend build" -Action {
+            & npm run build:check
         }
     }
     finally {
@@ -41,9 +64,8 @@ if (-not $PackageOnly) {
 Push-Location $projectRoot
 try {
     if (-not $PackageOnly) {
-        & $python -m PyInstaller --noconfirm --clean "Tradewind.spec"
-        if ($LASTEXITCODE -ne 0) {
-            throw "PyInstaller failed with exit code $LASTEXITCODE"
+        Invoke-NativeBuildStep -Description "PyInstaller" -Action {
+            & $python -m PyInstaller --noconfirm --clean "Tradewind.spec"
         }
     }
     elseif (-not (Test-Path -LiteralPath (Join-Path $outputDir "Tradewind.exe") -PathType Leaf)) {
