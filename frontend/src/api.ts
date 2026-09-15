@@ -1,7 +1,9 @@
 // Tradewind API 封装
 import type {
-  ConfigState, CrawlerState, CrawlerTarget, Customer, EmailResult, ExtractTask, HistoryItem, Lang, OutFormat,
-  PhotoLibraryStore, PhotoTaskState, Product, TaskState, Template,
+  ConfigState, CrawlerState, CrawlerTarget, Customer, EmailOutreachSettings, EmailResult,
+  ExtractTask, HistoryItem, Lang, OutFormat, OutreachChannel, OutreachJob,
+  OutreachStatus, OutreachSuppression, PhotoLibraryStore, PhotoTaskState, Product,
+  TaskState, Template,
 } from "./types";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
@@ -119,6 +121,45 @@ export const api = {
     list: (limit = 50) => req<HistoryItem[]>(`/api/history?limit=${limit}`),
     remove: (id: number) => req<{ ok: boolean }>(`/api/history/${id}`, { method: "DELETE" }),
     removeBatch: (ids: number[]) => post<{ ok: boolean; removed?: number; error?: string }>("/api/history/batch-delete", { ids }),
+  },
+
+  outreach: {
+    list: (channel?: OutreachChannel, statuses?: OutreachStatus[]) => {
+      const params = new URLSearchParams();
+      if (channel) params.set("channel", channel);
+      if (statuses?.length) params.set("status", statuses.join(","));
+      const query = params.toString();
+      return req<OutreachJob[]>(`/api/outreach/jobs${query ? `?${query}` : ""}`, { cache: "no-store" });
+    },
+    create: (payload: { customer_id: string; channel: OutreachChannel; content: string; language: Lang }) =>
+      post<{ ok: boolean; item?: OutreachJob; duplicate?: boolean; error?: string }>("/api/outreach/jobs", payload),
+    update: (id: number, payload: { subject: string; body: string }) =>
+      req<{ ok: boolean; item?: OutreachJob; error?: string }>(`/api/outreach/jobs/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    openWhatsApp: (id: number) =>
+      post<{ ok: boolean; item?: OutreachJob; url?: string; error?: string }>(`/api/outreach/jobs/${id}/open-whatsapp`, {}),
+    sendEmail: (id: number) =>
+      post<{ ok: boolean; item?: OutreachJob; error?: string; issues?: string[] }>(`/api/outreach/jobs/${id}/send-email`, {}),
+    rebindSender: (id: number) =>
+      post<{ ok: boolean; item?: OutreachJob; error?: string }>(`/api/outreach/jobs/${id}/rebind-sender`, {}),
+    transition: (id: number, status: OutreachStatus, reason = "") =>
+      post<{ ok: boolean; item?: OutreachJob; error?: string }>(`/api/outreach/jobs/${id}/transition`, { status, reason }),
+    listSuppressions: () => req<OutreachSuppression[]>("/api/outreach/suppressions", { cache: "no-store" }),
+    suppress: (payload: { channel: OutreachChannel; recipient: string; reason: string }) =>
+      post<{ ok: boolean; item?: OutreachSuppression; error?: string }>("/api/outreach/suppressions", payload),
+    unsuppress: (id: number) => req<{ ok: boolean; error?: string }>(`/api/outreach/suppressions/${id}`, { method: "DELETE" }),
+    getEmailSettings: () => req<EmailOutreachSettings>("/api/outreach/email-settings", { cache: "no-store" }),
+    saveEmailSettings: (payload: { provider: EmailOutreachSettings["provider"]; address: string; transport: EmailOutreachSettings["transport"]; credential?: string }) =>
+      req<{ ok: boolean; error?: string } & EmailOutreachSettings>("/api/outreach/email-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }),
+    deleteEmailCredential: () => req<{ ok: boolean; error?: string } & EmailOutreachSettings>("/api/outreach/email-settings/credential", { method: "DELETE" }),
+    testEmailSettings: () => post<{ ok: boolean; status?: string; code?: string; summary?: string; error?: string }>("/api/outreach/email-settings/test", {}),
   },
 
   crawler: {

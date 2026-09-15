@@ -74,7 +74,7 @@ try {
 
     Copy-Item -LiteralPath "packaging\README.txt" -Destination $outputDir -Force
     Copy-Item -LiteralPath "packaging\portable.flag.example" -Destination $outputDir -Force
-    $commit = (& git rev-parse --short HEAD 2>$null)
+    $commit = (& git -c "safe.directory=$projectRoot" rev-parse --short HEAD 2>$null)
     if (-not $commit) {
         $commit = "unavailable"
     }

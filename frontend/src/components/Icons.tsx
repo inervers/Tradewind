@@ -56,6 +56,8 @@ export const UploadIcon = (p: P) => base(p, <><path d="M12 15V4" /><path d="m7.5
 
 export const RadarIcon = (p: P) => base(p, <><circle cx="12" cy="12" r="8.5" /><circle cx="12" cy="12" r="3" /><path d="M12 3.5v4M12 16.5v4M3.5 12h4M16.5 12h4" /><path d="m5.5 5.5 2.8 2.8M15.7 15.7l2.8 2.8M18.5 5.5l-2.8 2.8M8.3 15.7l-2.8 2.8" /></>);
 
+export const RouteIcon = (p: P) => base(p, <><circle cx="5" cy="18" r="2" /><circle cx="19" cy="6" r="2" /><path d="M7 18h3.5a3 3 0 0 0 3-3v-6a3 3 0 0 1 3-3H17" /><path d="m9 8 3-3 3 3" /></>);
+
 export const PhotoIcon = (p: P) => base(p, <><rect x="3" y="4.5" width="18" height="15" rx="2" /><circle cx="8.5" cy="9" r="2" /><path d="m5 17 4.2-4.2 3.2 3 2.5-2.5L19 17" /></>);
 
 export const SailboatIcon = (p: P) => base(p, <>

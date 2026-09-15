@@ -45,6 +45,21 @@ PROVIDER_PRESETS: dict[str, dict] = {
     },
 }
 
+EMAIL_PROVIDER_PRESETS: dict[str, dict] = {
+    "qq_smtp": {
+        "name": "QQ 邮箱",
+        "host": "smtp.qq.com",
+        "ssl_port": 465,
+        "starttls_port": 587,
+    },
+    "gmail_smtp": {
+        "name": "Gmail",
+        "host": "smtp.gmail.com",
+        "ssl_port": 465,
+        "starttls_port": 587,
+    },
+}
+
 DEFAULT_PROVIDER = "deepseek"
 
 DEFAULT_COMPANY_PROFILE: dict[str, str] = {
@@ -121,6 +136,41 @@ def set_company_profile(profile: dict[str, str]) -> None:
         for key in DEFAULT_COMPANY_PROFILE
     }
     save_config_file({"company_profile": clean})
+
+
+def get_email_outreach_config() -> dict:
+    """Return non-secret SMTP settings for the single active sender."""
+    raw = load_config_file().get("email_outreach", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    provider = raw.get("provider", "qq_smtp")
+    if provider not in EMAIL_PROVIDER_PRESETS:
+        provider = "qq_smtp"
+    transport = raw.get("transport", "ssl")
+    if transport not in {"ssl", "starttls"}:
+        transport = "ssl"
+    return {
+        "provider": provider,
+        "address": str(raw.get("address", "")).strip(),
+        "transport": transport,
+    }
+
+
+def set_email_outreach_config(provider: str, address: str, transport: str) -> None:
+    """Persist only non-secret SMTP settings; credentials live in keyring."""
+    if provider not in EMAIL_PROVIDER_PRESETS:
+        raise ValueError("不支持的邮箱提供商")
+    if transport not in {"ssl", "starttls"}:
+        raise ValueError("不支持的 SMTP 加密方式")
+    save_config_file(
+        {
+            "email_outreach": {
+                "provider": provider,
+                "address": address.strip(),
+                "transport": transport,
+            }
+        }
+    )
 
 
 # ---------- Provider ----------

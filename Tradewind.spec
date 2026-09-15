@@ -10,6 +10,11 @@ datas = [
 binaries = []
 hiddenimports = collect_submodules("app")
 
+try:
+    hiddenimports += collect_submodules("keyring.backends")
+except Exception:
+    pass
+
 for package in ("rapidocr_onnxruntime",):
     try:
         package_datas, package_binaries, package_hidden = collect_all(package)

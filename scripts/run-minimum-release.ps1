@@ -67,9 +67,9 @@ function Invoke-AcceptanceStep {
     }
 }
 
-$sourceCommit = (& git -C $projectRoot rev-parse HEAD).Trim()
-$shortCommit = (& git -C $projectRoot rev-parse --short HEAD).Trim()
-$trackedChanges = @(& git -C $projectRoot status --porcelain --untracked-files=no)
+$sourceCommit = (& git -c "safe.directory=$projectRoot" -C $projectRoot rev-parse HEAD).Trim()
+$shortCommit = (& git -c "safe.directory=$projectRoot" -C $projectRoot rev-parse --short HEAD).Trim()
+$trackedChanges = @(& git -c "safe.directory=$projectRoot" -C $projectRoot status --porcelain --untracked-files=no)
 $allowedTrackedPaths = @("scripts/build-portable.ps1")
 $zipPath = Join-Path $projectRoot ("dist\Tradewind-Portable-" + $Version + ".zip")
 $checksumPath = "$zipPath.sha256.txt"
@@ -210,7 +210,7 @@ $overall = if (@($results | Where-Object { $_.status -ne "passed" }).Count -eq 0
 $summary = [ordered]@{
     schema_version = 1
     project = "Tradewind"
-    scope = "Browser Portable minimum release acceptance"
+    scope = "Browser Portable multichannel outreach acceptance; SMTP is covered by mocks and no real customer message is sent."
     status = $overall
     version = $Version
     source_commit = $sourceCommit
@@ -246,7 +246,7 @@ $reportLines.Add("- Version: $Version") | Out-Null
 $reportLines.Add("- Source commit: $sourceCommit") | Out-Null
 $reportLines.Add("- ZIP SHA-256: $archiveHash") | Out-Null
 $reportLines.Add("- Evaluation dataset SHA-256: $datasetHash") | Out-Null
-$reportLines.Add("- Scope: Browser Portable minimum release chain; excludes Tauri, SMTP, and real customer data") | Out-Null
+$reportLines.Add("- Scope: Browser Portable multichannel outreach acceptance; SMTP is covered by mocks and no real customer message is sent.") | Out-Null
 $reportLines.Add("") | Out-Null
 $reportLines.Add("## Automated acceptance") | Out-Null
 $reportLines.Add("") | Out-Null
@@ -258,7 +258,7 @@ foreach ($result in $results) {
 $reportLines.Add("") | Out-Null
 $reportLines.Add("## Evidence boundary") | Out-Null
 $reportLines.Add("") | Out-Null
-$reportLines.Add("This report covers the fixed source commit, secret scan, backend tests, offline evaluation, frontend build, ZIP integrity, and an extracted-package smoke test with isolated temporary data, health checking, document import, and the diagnostic privacy contract.") | Out-Null
+$reportLines.Add("This report covers the fixed source commit, secret scan, backend tests, offline evaluation, frontend build, ZIP integrity, and an extracted-package smoke test with isolated temporary data, health checking, document import, guarded WhatsApp link preparation, restart persistence, suppression, and the diagnostic privacy contract. SMTP is covered by mocks; no real customer message is sent.") | Out-Null
 $reportLines.Add("") | Out-Null
 $reportLines.Add("This host is Windows Home without Windows Sandbox or a configured VM, so this run is not evidence of replay on a separate clean Windows machine. Copy the ZIP, checksum, and scripts/test-portable.ps1 to a target without Python or Node and replay the smoke test to add that evidence.") | Out-Null
 $reportLines | Set-Content -LiteralPath (Join-Path $releaseRoot "acceptance-report.md") -Encoding UTF8

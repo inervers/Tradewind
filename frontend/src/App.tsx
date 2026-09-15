@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { AuroraBackground, FadeIn, useToast } from "./components/effects";
 import {
-  BatchIcon, BoxIcon, ClockIcon, GearIcon, InboxIcon, MailIcon, PhotoIcon, RadarIcon, SailboatIcon, UsersIcon,
+  BatchIcon, BoxIcon, ClockIcon, GearIcon, InboxIcon, MailIcon, PhotoIcon, RadarIcon, RouteIcon, SailboatIcon, UsersIcon,
 } from "./components/Icons";
 import { api } from "./api";
 import ComposeTab from "./tabs/ComposeTab";
@@ -13,13 +13,16 @@ import ProductsTab from "./tabs/ProductsTab";
 import HistoryTab from "./tabs/HistoryTab";
 import TemplatesTab from "./tabs/TemplatesTab";
 import SettingsTab from "./tabs/SettingsTab";
+import OutreachTab from "./tabs/OutreachTab";
+import type { ComposeSeed } from "./types";
 
-type TabKey = "compose" | "batch" | "customers" | "crawler" | "photos" | "products" | "templates" | "history" | "settings";
+type TabKey = "compose" | "batch" | "customers" | "outreach" | "crawler" | "photos" | "products" | "templates" | "history" | "settings";
 
 const TABS: { key: TabKey; label: string; icon: (p: { size?: number }) => ReactNode }[] = [
   { key: "compose", label: "开发信", icon: MailIcon },
   { key: "batch", label: "批量生成", icon: BatchIcon },
   { key: "customers", label: "客户名单", icon: UsersIcon },
+  { key: "outreach", label: "外联队列", icon: RouteIcon },
   { key: "crawler", label: "爬虫", icon: RadarIcon },
   { key: "photos", label: "照片库", icon: PhotoIcon },
   { key: "products", label: "产品资料", icon: BoxIcon },
@@ -126,7 +129,13 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [composeSeed, setComposeSeed] = useState<ComposeSeed | null>(null);
   const toast = useToast();
+
+  const startOutreach = useCallback((seed: ComposeSeed) => {
+    setComposeSeed(seed);
+    setTab("compose");
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -236,9 +245,16 @@ export default function App() {
       <main className="main">
         <TradeRoutes />
         <FadeIn key={tab}>
-          {tab === "compose" && <ComposeTab />}
+          {tab === "compose" && (
+            <ComposeTab
+              seed={composeSeed}
+              onSeedConsumed={() => setComposeSeed(null)}
+              onOpenOutreach={() => setTab("outreach")}
+            />
+          )}
           {tab === "batch" && <BatchTab />}
-          {tab === "customers" && <CustomersTab />}
+          {tab === "customers" && <CustomersTab onStartOutreach={startOutreach} />}
+          {tab === "outreach" && <OutreachTab />}
           {tab === "crawler" && <CrawlerTab />}
           {tab === "photos" && <PhotosTab />}
           {tab === "products" && <ProductsTab />}

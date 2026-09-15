@@ -92,6 +92,70 @@ export interface HistoryItem {
   created_at: number;
 }
 
+// ---------- 人工审核外联 ----------
+
+export type OutreachChannel = "whatsapp" | "email";
+export type OutreachStatus =
+  | "pending_review"
+  | "opened"
+  | "sent_manual"
+  | "sending"
+  | "accepted"
+  | "unknown"
+  | "failed"
+  | "replied"
+  | "invalid"
+  | "skipped"
+  | "suppressed";
+
+export interface OutreachJob {
+  id: number;
+  customer_id: string;
+  customer_name_snapshot: string;
+  channel: OutreachChannel;
+  provider: "whatsapp_link" | "qq_smtp" | "gmail_smtp";
+  sender_account_snapshot: string;
+  recipient: string;
+  subject: string;
+  body: string;
+  message_id: string;
+  status: OutreachStatus;
+  provider_reference: string;
+  error_code: string;
+  error_summary: string;
+  created_at: number;
+  updated_at: number;
+  opened_at?: number | null;
+  submitted_at?: number | null;
+  replied_at?: number | null;
+}
+
+export interface EmailOutreachSettings {
+  provider: "qq_smtp" | "gmail_smtp";
+  address: string;
+  transport: "ssl" | "starttls";
+  host: string;
+  port: number;
+  has_credential: boolean;
+  credential_error?: string;
+}
+
+export interface OutreachSuppression {
+  id: number;
+  channel: OutreachChannel;
+  masked_recipient: string;
+  reason: string;
+  created_at: number;
+}
+
+export interface ComposeSeed {
+  customerId: string;
+  name: string;
+  country: string;
+  notes: string;
+  channel: OutreachChannel;
+}
+
 // ---------- 爬虫 ----------
 
 export type CrawlerTarget = "all" | "email" | "phone" | "whatsapp";

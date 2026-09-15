@@ -30,22 +30,41 @@ from xml.etree import ElementTree
 warnings.filterwarnings("ignore", message="Couldn't find ffmpeg or avconv.*")
 
 import httpx
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.config import (
-    PROVIDER_PRESETS, ROOT_DIR, VISION_PROVIDERS, get_active_provider, get_company_profile,
+    EMAIL_PROVIDER_PRESETS, PROVIDER_PRESETS, ROOT_DIR, VISION_PROVIDERS,
+    get_active_provider, get_company_profile, get_email_outreach_config,
     get_provider_config, get_vision_config, get_vision_failover_configs,
     get_vision_provider_config, set_active_provider, set_api_key,
-    set_company_profile, set_provider_params, set_vision_config, settings, vision_key_format_error,
+    set_company_profile, set_email_outreach_config, set_provider_params,
+    set_vision_config, settings, vision_key_format_error,
 )
+from app.credential_store import CredentialStore, CredentialUnavailable
 from app.email_agent import GenerationCancelled, generate_email
 from app.crawler.progress import use_progress_sink
 from app.crawler.result_utils import matches_targets
 from app.memory import delete_email, delete_emails, recent_emails
+from app.outreach_channels import (
+    build_whatsapp_link,
+    ensure_cold_email_footer,
+    normalize_whatsapp_number,
+    split_generated_email,
+    validate_email_draft,
+)
+from app.outreach_smtp import SmtpSender
+from app.outreach_store import (
+    ACTIVE_STATUSES,
+    InvalidTransition,
+    OutreachConflict,
+    OutreachNotFound,
+    OutreachStore,
+    SuppressedContact,
+)
 from app.task_utils import prune_finished_tasks
 
 ROOT = ROOT_DIR
@@ -108,14 +127,41 @@ def _ensure_data_files() -> None:
 
 _ensure_data_files()
 
+LOCAL_UI_ORIGINS = {
+    "http://127.0.0.1:8101",
+    "http://localhost:8101",
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+}
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def is_trusted_mutation_origin(method: str, origin: str | None) -> bool:
+    if method.upper() not in MUTATING_METHODS:
+        return True
+    return origin is None or origin in LOCAL_UI_ORIGINS
+
+
 app = FastAPI(title="Tradewind", version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=sorted(LOCAL_UI_ORIGINS),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
+
+
+@app.middleware("http")
+async def reject_untrusted_browser_origins(request: Request, call_next):
+    if request.url.path.startswith("/api/") and not is_trusted_mutation_origin(
+        request.method, request.headers.get("origin")
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "不允许从该网页来源修改本机数据"},
+        )
+    return await call_next(request)
 
 
 # ---------- 工具 ----------
@@ -247,6 +293,36 @@ class CustomerRequest(BaseModel):
     phone: str = ""
     notes: str = ""
     status: str = "new"
+
+
+class OutreachCreateRequest(BaseModel):
+    customer_id: str
+    channel: str
+    content: str
+    language: str = "en"
+
+
+class OutreachContentRequest(BaseModel):
+    subject: str = ""
+    body: str
+
+
+class OutreachTransitionRequest(BaseModel):
+    status: str
+    reason: str = ""
+
+
+class OutreachSuppressionRequest(BaseModel):
+    channel: str
+    recipient: str
+    reason: str
+
+
+class OutreachEmailSettingsRequest(BaseModel):
+    provider: str
+    address: str
+    transport: str = "ssl"
+    credential: str = ""
 
 
 class BatchRequest(BaseModel):
@@ -517,6 +593,13 @@ def _build_diagnostic_report() -> dict:
         }
         for pid in VISION_PROVIDERS
     }
+    outreach_counts = {"jobs_total": 0, "by_channel": {}, "by_status": {}}
+    if MEMORY_DB_FILE.is_file():
+        try:
+            outreach_counts = OutreachStore(MEMORY_DB_FILE).aggregate_counts()
+        except Exception:  # noqa: BLE001 - 诊断失败时只保留空统计，不暴露数据库错误
+            pass
+    email_outreach = get_email_outreach_config()
     photo_files = []
     if CRAWLER_PHOTOS_DIR.is_dir():
         try:
@@ -560,6 +643,11 @@ def _build_diagnostic_report() -> dict:
                 "store_count": sum(1 for path in CRAWLER_PHOTOS_DIR.iterdir() if path.is_dir()) if CRAWLER_PHOTOS_DIR.is_dir() else 0,
                 "photo_count": len(photo_files),
             },
+        },
+        "outreach": {
+            **outreach_counts,
+            "email_provider": str(email_outreach.get("provider") or ""),
+            "email_configured": bool(email_outreach.get("address")),
         },
         "errors": {
             "crawler": _diagnostic_error_summary(DATA_DIR / "crawler_errors.log"),
@@ -1593,6 +1681,7 @@ def api_customer_add(req: CustomerRequest) -> dict:
         "city": req.city.strip(),
         "email": req.email.strip(),
         "website": req.website.strip(),
+        "phone": req.phone.strip(),
         "notes": req.notes.strip(),
         "source": "manual",
         "status": req.status if req.status in ("new", "sent", "replied") else "new",
@@ -2037,6 +2126,433 @@ def api_crawler_cancel(task_id: str) -> dict:
         return {"ok": False, "error": "任务已结束"}
     t["cancel"] = True
     return {"ok": True}
+
+
+# ---------- 业务 API：人工审核外联队列 ----------
+
+def _outreach_store() -> OutreachStore:
+    return OutreachStore(MEMORY_DB_FILE)
+
+
+def _find_customer_by_id(customer_id: str) -> dict | None:
+    return next(
+        (
+            item
+            for item in _read_json(CUSTOMERS_FILE, [])
+            if str(item.get("id", "")) == customer_id
+        ),
+        None,
+    )
+
+
+def _existing_active_outreach(customer_id: str, channel: str) -> dict | None:
+    return next(
+        (
+            item
+            for item in _outreach_store().list_jobs(
+                channel=channel, statuses=set(ACTIVE_STATUSES)
+            )
+            if item["customer_id"] == customer_id
+        ),
+        None,
+    )
+
+
+def _recipient_is_suppressed(channel: str, recipient: str) -> bool:
+    if channel == "email":
+        normalized = recipient.strip().casefold()
+    else:
+        normalized = re.sub(r"\D", "", recipient)
+    return any(
+        item["channel"] == channel and item["normalized_recipient"] == normalized
+        for item in _outreach_store().list_suppressions()
+    )
+
+
+def sync_customer_outreach_status(customer_id: str, status: str) -> None:
+    if status not in {"sent", "replied"}:
+        return
+    items = _read_json(CUSTOMERS_FILE, [])
+    changed = False
+    for item in items:
+        if str(item.get("id", "")) == customer_id and item.get("status") != status:
+            item["status"] = status
+            changed = True
+            break
+    if changed:
+        _write_json(CUSTOMERS_FILE, items)
+
+
+@app.get("/api/outreach/jobs")
+def api_outreach_jobs(
+    channel: str | None = None,
+    status: str = "",
+    limit: int = 200,
+) -> list[dict]:
+    statuses = {value.strip() for value in status.split(",") if value.strip()} or None
+    try:
+        return _outreach_store().list_jobs(channel=channel, statuses=statuses, limit=limit)
+    except ValueError:
+        return []
+
+
+@app.post("/api/outreach/jobs")
+def api_outreach_create(req: OutreachCreateRequest) -> dict:
+    customer = _find_customer_by_id(req.customer_id.strip())
+    if customer is None:
+        return {"ok": False, "error": "客户不存在"}
+    content = req.content.strip()
+    if not content:
+        return {"ok": False, "error": "外联内容不能为空"}
+    channel = req.channel.strip().casefold()
+    profile = get_company_profile()
+    try:
+        if channel == "email":
+            recipient = str(customer.get("email", "")).strip().casefold()
+            if "@" not in recipient:
+                return {"ok": False, "error": "客户没有可用邮箱"}
+            if _recipient_is_suppressed(channel, recipient):
+                return {"ok": False, "code": "suppressed", "error": "该邮箱已加入禁止联系名单"}
+            config = get_email_outreach_config()
+            if not config["address"]:
+                return {"ok": False, "error": "请先配置发件邮箱"}
+            subject, body = split_generated_email(content)
+            body = ensure_cold_email_footer(
+                body,
+                profile.get("sender_name", ""),
+                profile.get("company_name", ""),
+                req.language,
+            )
+            provider = config["provider"]
+            sender_account = config["address"]
+        elif channel == "whatsapp":
+            phone = str(customer.get("phone", "")).strip()
+            recipient = normalize_whatsapp_number(
+                phone, str(customer.get("country", ""))
+            )
+            if _recipient_is_suppressed(channel, recipient):
+                return {"ok": False, "code": "suppressed", "error": "该号码已加入禁止联系名单"}
+            subject = ""
+            body = content
+            provider = "whatsapp_link"
+            sender_account = ""
+        else:
+            return {"ok": False, "error": "不支持的外联渠道"}
+        item = _outreach_store().create_job(
+            customer_id=str(customer["id"]),
+            customer_name=str(customer.get("name", "")),
+            channel=channel,
+            provider=provider,
+            sender_account=sender_account,
+            recipient=recipient,
+            subject=subject,
+            body=body,
+        )
+        return {"ok": True, "item": item}
+    except OutreachConflict:
+        return {
+            "ok": False,
+            "duplicate": True,
+            "error": "该客户已有待处理的同渠道外联任务",
+            "item": _existing_active_outreach(req.customer_id.strip(), channel),
+        }
+    except SuppressedContact:
+        return {"ok": False, "code": "suppressed", "error": "该联系方式已加入禁止联系名单"}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.put("/api/outreach/jobs/{job_id}")
+def api_outreach_update(job_id: int, req: OutreachContentRequest) -> dict:
+    try:
+        item = _outreach_store().update_content(job_id, req.subject, req.body)
+        return {"ok": True, "item": item}
+    except (OutreachNotFound, OutreachConflict, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/outreach/jobs/{job_id}/open-whatsapp")
+def api_outreach_open_whatsapp(job_id: int) -> dict:
+    try:
+        store = _outreach_store()
+        job = store.get_job(job_id)
+        if job["channel"] != "whatsapp":
+            return {"ok": False, "error": "该任务不是 WhatsApp 渠道"}
+        url = build_whatsapp_link(f"+{job['recipient']}", "", job["body"])
+        item = store.mark_opened(job_id)
+        return {"ok": True, "url": url, "item": item}
+    except (OutreachNotFound, OutreachConflict, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/outreach/jobs/{job_id}/transition")
+def api_outreach_transition(job_id: int, req: OutreachTransitionRequest) -> dict:
+    manual_targets = {
+        "pending_review", "sent_manual", "invalid", "skipped",
+        "replied", "accepted", "failed",
+    }
+    if req.status not in manual_targets:
+        return {"ok": False, "error": "该状态只能由系统内部更新"}
+    try:
+        item = _outreach_store().transition(job_id, req.status, req.reason)
+        if item["status"] in {"sent_manual", "accepted"}:
+            sync_customer_outreach_status(item["customer_id"], "sent")
+        elif item["status"] == "replied":
+            sync_customer_outreach_status(item["customer_id"], "replied")
+        return {"ok": True, "item": item}
+    except (OutreachNotFound, OutreachConflict, InvalidTransition) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/outreach/suppressions")
+def api_outreach_suppressions() -> list[dict]:
+    return [
+        {key: value for key, value in item.items() if key != "normalized_recipient"}
+        for item in _outreach_store().list_suppressions()
+    ]
+
+
+@app.post("/api/outreach/suppressions")
+def api_outreach_suppress(req: OutreachSuppressionRequest) -> dict:
+    try:
+        item = _outreach_store().add_suppression(
+            req.channel, req.recipient, req.reason
+        )
+        public_item = {
+            key: value for key, value in item.items() if key != "normalized_recipient"
+        }
+        return {"ok": True, "item": public_item}
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.delete("/api/outreach/suppressions/{suppression_id}")
+def api_outreach_unsuppress(suppression_id: int) -> dict:
+    try:
+        _outreach_store().delete_suppression(suppression_id)
+        return {"ok": True}
+    except OutreachNotFound as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _valid_email_sender(provider: str, address: str) -> bool:
+    value = address.strip().casefold()
+    if provider == "qq_smtp":
+        return bool(re.fullmatch(r"[^@\s]+@qq\.com", value))
+    if provider == "gmail_smtp":
+        return bool(re.fullmatch(r"[^@\s]+@(gmail|googlemail)\.com", value))
+    return False
+
+
+def _email_settings_view() -> dict:
+    config = get_email_outreach_config()
+    preset = EMAIL_PROVIDER_PRESETS[config["provider"]]
+    has_credential = False
+    credential_error = ""
+    if config["address"]:
+        try:
+            has_credential = CredentialStore().has(
+                config["provider"], config["address"]
+            )
+        except CredentialUnavailable:
+            credential_error = "系统凭据管理器不可用"
+    return {
+        "provider": config["provider"],
+        "address": config["address"],
+        "transport": config["transport"],
+        "host": preset["host"],
+        "port": preset[
+            "ssl_port" if config["transport"] == "ssl" else "starttls_port"
+        ],
+        "has_credential": has_credential,
+        "credential_error": credential_error,
+    }
+
+
+@app.get("/api/outreach/email-settings")
+def api_outreach_email_settings() -> dict:
+    return _email_settings_view()
+
+
+@app.put("/api/outreach/email-settings")
+def api_outreach_email_settings_save(req: OutreachEmailSettingsRequest) -> dict:
+    provider = req.provider.strip()
+    address = req.address.strip().casefold()
+    transport = req.transport.strip().casefold()
+    if not _valid_email_sender(provider, address):
+        return {"ok": False, "error": "邮箱账号与所选提供商不匹配"}
+    if transport not in {"ssl", "starttls"}:
+        return {"ok": False, "error": "不支持的 SMTP 加密方式"}
+    current = get_email_outreach_config()
+    identity_changed = (
+        current["provider"] != provider
+        or current["address"].casefold() != address.casefold()
+    )
+    credential = req.credential.strip()
+    store = CredentialStore()
+    try:
+        if credential:
+            store.set(provider, address, credential)
+        elif identity_changed or not store.has(provider, address):
+            return {"ok": False, "error": "新邮箱账号必须填写授权凭据"}
+        set_email_outreach_config(provider, address, transport)
+        return {"ok": True, **_email_settings_view()}
+    except (CredentialUnavailable, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.delete("/api/outreach/email-settings/credential")
+def api_outreach_email_credential_delete() -> dict:
+    config = get_email_outreach_config()
+    if not config["address"]:
+        return {"ok": True, **_email_settings_view()}
+    try:
+        CredentialStore().delete(config["provider"], config["address"])
+        return {"ok": True, **_email_settings_view()}
+    except CredentialUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/outreach/email-settings/test")
+def api_outreach_email_settings_test() -> dict:
+    config = get_email_outreach_config()
+    if not _valid_email_sender(config["provider"], config["address"]):
+        return {"ok": False, "error": "请先保存有效的发件邮箱"}
+    try:
+        secret = CredentialStore().get(config["provider"], config["address"])
+        outcome = SmtpSender().test_connection(config, secret)
+        return {
+            "ok": outcome.status == "accepted",
+            "status": outcome.status,
+            "code": outcome.code,
+            "summary": outcome.summary,
+        }
+    except CredentialUnavailable as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/outreach/jobs/{job_id}/rebind-sender")
+def api_outreach_rebind_sender(job_id: int) -> dict:
+    config = get_email_outreach_config()
+    if not _valid_email_sender(config["provider"], config["address"]):
+        return {"ok": False, "error": "请先保存有效的发件邮箱"}
+    try:
+        item = _outreach_store().rebind_email_sender(
+            job_id, config["provider"], config["address"]
+        )
+        return {"ok": True, "item": item}
+    except (OutreachNotFound, OutreachConflict, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _execute_claimed_outreach_email(job_id: int) -> None:
+    store = _outreach_store()
+    try:
+        job = store.get_job(job_id)
+        if job["status"] != "sending":
+            return
+        config = get_email_outreach_config()
+        if (
+            job["provider"] != config["provider"]
+            or job["sender_account_snapshot"].casefold()
+            != config["address"].casefold()
+        ):
+            store.complete_email_send(
+                job_id,
+                "failed",
+                "sender_changed",
+                "发件账号已变化，请重新审核",
+            )
+            return
+        profile = get_company_profile()
+        issues = validate_email_draft(
+            job["subject"],
+            job["body"],
+            profile.get("sender_name", ""),
+            profile.get("company_name", ""),
+        )
+        if issues:
+            store.complete_email_send(
+                job_id, "failed", "draft_invalid", ",".join(issues)
+            )
+            return
+        secret = CredentialStore().get(config["provider"], config["address"])
+        outcome = SmtpSender().send(job, config, secret)
+        try:
+            store.complete_email_send(
+                job_id,
+                outcome.status,
+                outcome.code,
+                outcome.summary,
+                outcome.reference,
+            )
+        except OutreachConflict:
+            return
+        if outcome.status == "accepted":
+            sync_customer_outreach_status(job["customer_id"], "sent")
+    except CredentialUnavailable:
+        try:
+            store.complete_email_send(
+                job_id,
+                "failed",
+                "credential_unavailable",
+                "邮箱凭据不可用，请重新配置",
+            )
+        except (OutreachConflict, OutreachNotFound):
+            pass
+    except Exception:
+        try:
+            store.complete_email_send(
+                job_id,
+                "unknown",
+                "internal_uncertain",
+                "发送状态无法确认，请检查发件箱",
+            )
+        except (OutreachConflict, OutreachNotFound):
+            pass
+
+
+@app.post("/api/outreach/jobs/{job_id}/send-email")
+def api_outreach_send_email(job_id: int) -> dict:
+    try:
+        store = _outreach_store()
+        job = store.get_job(job_id)
+        if job["channel"] != "email":
+            return {"ok": False, "error": "该任务不是邮件渠道"}
+        config = get_email_outreach_config()
+        if (
+            job["provider"] != config["provider"]
+            or job["sender_account_snapshot"].casefold()
+            != config["address"].casefold()
+        ):
+            return {"ok": False, "error": "发件账号已变化，请重新审核"}
+        profile = get_company_profile()
+        issues = validate_email_draft(
+            job["subject"],
+            job["body"],
+            profile.get("sender_name", ""),
+            profile.get("company_name", ""),
+        )
+        if issues:
+            return {"ok": False, "error": "开发信未通过发送前检查", "issues": issues}
+        if not CredentialStore().has(config["provider"], config["address"]):
+            return {"ok": False, "error": "邮箱授权凭据尚未配置"}
+        claimed = store.claim_email_send(job_id)
+        threading.Thread(
+            target=_execute_claimed_outreach_email,
+            args=(job_id,),
+            daemon=True,
+        ).start()
+        return {"ok": True, "item": claimed}
+    except (OutreachNotFound, OutreachConflict, CredentialUnavailable) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def recover_outreach_after_startup() -> int:
+    return _outreach_store().recover_interrupted()
+
+
+app.router.add_event_handler("startup", recover_outreach_after_startup)
 
 
 # ---------- 静态托管（API 路由定义之后再 mount，避免覆盖） ----------

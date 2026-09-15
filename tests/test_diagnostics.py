@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import server
+from app.outreach_store import OutreachStore
 
 
 class DiagnosticExportTests(unittest.TestCase):
@@ -28,7 +29,17 @@ class DiagnosticExportTests(unittest.TestCase):
             )
             products.write_text("[]", encoding="utf-8")
             templates.write_text("[]", encoding="utf-8")
-            memory.write_bytes(b"private-history")
+            store = OutreachStore(memory)
+            store.create_job(
+                customer_id="c-private",
+                customer_name="Private Clinic",
+                channel="email",
+                provider="gmail_smtp",
+                sender_account="sender@example.test",
+                recipient="buyer@example.test",
+                subject="Private subject",
+                body="private outreach body",
+            )
             (store_dir / "private-photo.jpg").write_bytes(b"\xff\xd8\xffprivate")
             (data_dir / "crawler_errors.log").write_text(
                 "ConnectTimeout: customer Private Clinic https://private.example.test sk-private-secret\nHTTP 503",
@@ -69,6 +80,20 @@ class DiagnosticExportTests(unittest.TestCase):
                         side_effect=lambda _pid: {"api_key": "vision-private", "model": "safe-vision-model"},
                     )
                 )
+                stack.enter_context(
+                    patch.object(
+                        server,
+                        "get_email_outreach_config",
+                        return_value={
+                            "provider": "gmail_smtp",
+                            "address": "sender@example.test",
+                            "transport": "ssl",
+                        },
+                    )
+                )
+                credential_get = stack.enter_context(
+                    patch.object(server.CredentialStore, "get", return_value="fake-app-password")
+                )
                 response = server.export_diagnostics()
 
             with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
@@ -80,12 +105,21 @@ class DiagnosticExportTests(unittest.TestCase):
             self.assertEqual(report["errors"]["crawler"]["error_types"], {"ConnectTimeout": 1})
             self.assertEqual(report["errors"]["crawler"]["http_statuses"], {"503": 1})
             self.assertTrue(report["models"]["providers"]["deepseek"]["configured"])
+            self.assertEqual(report["outreach"]["jobs_total"], 1)
+            self.assertEqual(report["outreach"]["by_channel"], {"email": 1})
+            self.assertEqual(report["outreach"]["by_status"], {"pending_review": 1})
+            credential_get.assert_not_called()
             for private_value in (
                 "Private Clinic",
                 "owner@example.test",
                 "private.example.test",
                 "sk-private-secret",
                 "vision-private",
+                "buyer@example.test",
+                "private outreach body",
+                "Private subject",
+                "sender@example.test",
+                "fake-app-password",
                 "private-photo.jpg",
                 temp_dir,
             ):

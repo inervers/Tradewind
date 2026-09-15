@@ -178,6 +178,87 @@ interface TemplateComboProps {
   templates: Template[];
 }
 
+interface SelectOption {
+  value: string;
+  label: string;
+}
+
+interface SelectComboProps {
+  id: string;
+  value: string;
+  ariaLabel: string;
+  options: readonly SelectOption[];
+  onChange: (value: string) => void;
+}
+
+/** 固定选项下拉：复用项目主题面板，避免浏览器原生菜单破坏视觉一致性。 */
+export function SelectCombo({ id, value, ariaLabel, options, onChange }: SelectComboProps) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const selected = options.find((option) => option.value === value);
+  const listboxId = `${id}-listbox`;
+
+  useEffect(() => {
+    const close = (event: MouseEvent) => {
+      if (ref.current && !ref.current.contains(event.target as Node)) setOpen(false);
+    };
+    const esc = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", esc);
+    };
+  }, []);
+
+  const choose = (nextValue: string) => {
+    if (nextValue !== value) onChange(nextValue);
+    setOpen(false);
+  };
+
+  return (
+    <div className="combo" ref={ref}>
+      <button
+        id={id}
+        type="button"
+        className="input combo-trigger combo-trigger-select"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={listboxId}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="combo-trigger-label">{selected?.label || value}</span>
+        <svg className="vision-combo-chevron" width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+          <path d="m3.5 5.25 3.5 3.5 3.5-3.5" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      {open && (
+        <div id={listboxId} className="combo-panel combo-select-panel" role="listbox" aria-labelledby={id}>
+          {options.map((option) => {
+            const isSelected = option.value === value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                className="combo-item combo-select-item"
+                role="option"
+                aria-selected={isSelected}
+                onClick={() => choose(option.value)}
+              >
+                <span className="combo-title">{option.label}</span>
+                {isSelected && <span className="combo-select-mark" aria-hidden="true">✓</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** 批量生成的话术选择：空值代表自动匹配，指定后固定使用该模板。 */
 export function TemplateCombo({ value, onChange, templates }: TemplateComboProps) {
   const [open, setOpen] = useState(false);

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
+import ConfirmDialog from "../components/ConfirmDialog";
 import { FadeIn, useToast } from "../components/effects";
 import { DownloadIcon, GearIcon, KeyIcon } from "../components/Icons";
-import { VisionModelCombo } from "../components/Combo";
-import type { ConfigState, ProviderInfo } from "../types";
+import { SelectCombo, VisionModelCombo } from "../components/Combo";
+import type { ConfigState, EmailOutreachSettings, ProviderInfo } from "../types";
 
 const VISION_PROVIDER_NAMES: Record<string, string> = {
   glm: "智谱 GLM",
@@ -47,6 +48,25 @@ const EMPTY_COMPANY_PROFILE = {
   website: "",
 };
 
+const EMPTY_EMAIL_SETTINGS: EmailOutreachSettings = {
+  provider: "qq_smtp",
+  address: "",
+  transport: "ssl",
+  host: "smtp.qq.com",
+  port: 465,
+  has_credential: false,
+};
+
+const EMAIL_PROVIDER_OPTIONS = [
+  { value: "qq_smtp", label: "QQ 邮箱" },
+  { value: "gmail_smtp", label: "Gmail" },
+] as const;
+
+const EMAIL_TRANSPORT_OPTIONS = [
+  { value: "ssl", label: "SSL · 465" },
+  { value: "starttls", label: "STARTTLS · 587" },
+] as const;
+
 export default function SettingsTab() {
   const [config, setConfig] = useState<ConfigState>({ has_key: false });
   const [editing, setEditing] = useState<string | null>(null); // 正在配置的 provider id
@@ -64,6 +84,10 @@ export default function SettingsTab() {
   const [companyProfile, setCompanyProfile] = useState(EMPTY_COMPANY_PROFILE);
   const [companyBusy, setCompanyBusy] = useState(false);
   const [diagnosticBusy, setDiagnosticBusy] = useState(false);
+  const [emailSettings, setEmailSettings] = useState<EmailOutreachSettings>(EMPTY_EMAIL_SETTINGS);
+  const [emailCredential, setEmailCredential] = useState("");
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [deleteEmailCredentialOpen, setDeleteEmailCredentialOpen] = useState(false);
   const toast = useToast();
 
   const load = useCallback(() => {
@@ -78,9 +102,16 @@ export default function SettingsTab() {
       .catch(() => {});
   }, []);
 
+  const loadEmailSettings = useCallback(() => {
+    api.outreach.getEmailSettings()
+      .then(setEmailSettings)
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     load();
-  }, [load]);
+    loadEmailSettings();
+  }, [load, loadEmailSettings]);
 
   const openEdit = useCallback((p: ProviderInfo) => {
     setEditing(p.id);
@@ -217,6 +248,60 @@ export default function SettingsTab() {
       toast.push(error instanceof Error ? error.message : "诊断包导出失败", "error");
     } finally {
       setDiagnosticBusy(false);
+    }
+  }, [toast.push]);
+
+  const saveEmailSettings = useCallback(async () => {
+    setEmailBusy(true);
+    try {
+      const result = await api.outreach.saveEmailSettings({
+        provider: emailSettings.provider,
+        address: emailSettings.address.trim(),
+        transport: emailSettings.transport,
+        credential: emailCredential,
+      });
+      if (!result.ok) {
+        toast.push(result.error || "邮箱设置保存失败", "error");
+        return;
+      }
+      setEmailCredential("");
+      setEmailSettings(result);
+      toast.push("发件邮箱已保存，凭据由 Windows 安全存储", "ok");
+    } catch (error) {
+      toast.push(error instanceof Error ? error.message : "邮箱设置保存失败", "error");
+    } finally {
+      setEmailBusy(false);
+    }
+  }, [emailCredential, emailSettings, toast.push]);
+
+  const testEmailSettings = useCallback(async () => {
+    setEmailBusy(true);
+    try {
+      const result = await api.outreach.testEmailSettings();
+      toast.push(result.ok ? (result.summary || "连接成功") : (result.error || result.summary || "连接失败"), result.ok ? "ok" : "error");
+    } catch (error) {
+      toast.push(error instanceof Error ? error.message : "连接测试失败", "error");
+    } finally {
+      setEmailBusy(false);
+    }
+  }, [toast.push]);
+
+  const deleteEmailCredential = useCallback(async () => {
+    setEmailBusy(true);
+    try {
+      const result = await api.outreach.deleteEmailCredential();
+      if (!result.ok) {
+        toast.push(result.error || "移除凭据失败", "error");
+        return;
+      }
+      setEmailSettings(result);
+      setEmailCredential("");
+      setDeleteEmailCredentialOpen(false);
+      toast.push("邮箱授权凭据已从 Windows 安全存储移除", "ok");
+    } catch (error) {
+      toast.push(error instanceof Error ? error.message : "移除凭据失败", "error");
+    } finally {
+      setEmailBusy(false);
     }
   }, [toast.push]);
 
@@ -393,6 +478,86 @@ export default function SettingsTab() {
         </div>
       </div>
 
+      <div className="card email-outreach-settings" style={{ marginTop: 16 }}>
+        <div className="card-title">
+          <span>QQ / Gmail 发件邮箱</span>
+          <span className={`badge ${emailSettings.has_credential ? "badge-ok" : "badge-warn"}`}>
+            {emailSettings.has_credential ? "凭据已安全保存" : "尚未配置凭据"}
+          </span>
+        </div>
+        <p className="setup-tip" style={{ marginTop: 0 }}>
+          只用于外联队列中逐封确认后的邮件。授权码或应用专用密码保存在 Windows 凭据管理器，不写入 config.json、数据库或诊断包。
+        </p>
+        <div className="email-settings-grid">
+          <div className="field">
+            <label className="field-label" htmlFor="email-provider">邮箱提供商</label>
+            <SelectCombo
+              id="email-provider"
+              ariaLabel="邮箱提供商"
+              value={emailSettings.provider}
+              options={EMAIL_PROVIDER_OPTIONS}
+              onChange={(value) => {
+                const provider = value as EmailOutreachSettings["provider"];
+                setEmailSettings({
+                  ...emailSettings,
+                  provider,
+                  host: provider === "qq_smtp" ? "smtp.qq.com" : "smtp.gmail.com",
+                  has_credential: false,
+                });
+                setEmailCredential("");
+              }}
+            />
+          </div>
+          <div className="field email-settings-address">
+            <label className="field-label" htmlFor="email-address">完整发件邮箱</label>
+            <input
+              id="email-address"
+              className="input"
+              type="email"
+              value={emailSettings.address}
+              placeholder={emailSettings.provider === "qq_smtp" ? "example@qq.com" : "example@gmail.com"}
+              onChange={(event) => setEmailSettings({ ...emailSettings, address: event.target.value })}
+            />
+          </div>
+          <div className="field">
+            <label className="field-label" htmlFor="email-transport">加密方式</label>
+            <SelectCombo
+              id="email-transport"
+              ariaLabel="加密方式"
+              value={emailSettings.transport}
+              options={EMAIL_TRANSPORT_OPTIONS}
+              onChange={(value) => setEmailSettings({ ...emailSettings, transport: value as EmailOutreachSettings["transport"] })}
+            />
+          </div>
+          <div className="field email-settings-secret">
+            <label className="field-label" htmlFor="email-credential">
+              {emailSettings.provider === "qq_smtp" ? "QQ 邮箱授权码" : "Gmail 应用专用密码"}
+            </label>
+            <input
+              id="email-credential"
+              className="input"
+              type="password"
+              autoComplete="new-password"
+              value={emailCredential}
+              placeholder={emailSettings.has_credential ? "已配置，留空保持不变" : "仅写入 Windows 凭据管理器"}
+              onChange={(event) => setEmailCredential(event.target.value)}
+            />
+          </div>
+        </div>
+        <div className="email-settings-meta">
+          <span>{emailSettings.host} · {emailSettings.transport === "ssl" ? 465 : 587}</span>
+          <span>连接测试只验证加密连接与登录，不发送测试邮件。</span>
+        </div>
+        {emailSettings.credential_error && <div className="outreach-notice status-failed">{emailSettings.credential_error}</div>}
+        <div className="email-settings-actions">
+          <button className="btn btn-primary" onClick={saveEmailSettings} disabled={emailBusy || !emailSettings.address.trim()}>
+            {emailBusy ? "处理中…" : "保存邮箱设置"}
+          </button>
+          <button className="btn btn-ghost" onClick={testEmailSettings} disabled={emailBusy || !emailSettings.has_credential}>测试连接</button>
+          <button className="btn btn-danger" onClick={() => setDeleteEmailCredentialOpen(true)} disabled={emailBusy || !emailSettings.has_credential}>移除凭据</button>
+        </div>
+      </div>
+
       <div className="card" style={{ marginTop: 16 }}>
         <div className="card-title"><span>数据存放位置</span></div>
         <p className="setup-tip" style={{ marginTop: 0 }}>
@@ -526,6 +691,16 @@ export default function SettingsTab() {
           生成 → 规则自检 → 质量评分 → 历史复盘，全链路本地运行。
         </p>
       </div>
+      {deleteEmailCredentialOpen && (
+        <ConfirmDialog
+          title="移除邮箱授权凭据？"
+          desc="只会从 Windows 凭据管理器移除当前账号的授权码或应用专用密码。已有草稿不会自动发送。"
+          confirmText="确认移除"
+          busy={emailBusy}
+          onCancel={() => setDeleteEmailCredentialOpen(false)}
+          onConfirm={deleteEmailCredential}
+        />
+      )}
       {toast.el}
     </>
   );

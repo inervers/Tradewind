@@ -32,6 +32,23 @@ $oldDataDir = $env:TRADEWIND_DATA_DIR
 $oldNoBrowser = $env:TRADEWIND_NO_BROWSER
 $process = $null
 
+function Start-PortableAppAndWait {
+    param([Parameter(Mandatory = $true)][string]$Executable)
+    $started = Start-Process -FilePath $Executable -WindowStyle Hidden -PassThru
+    for ($i = 0; $i -lt 240; $i++) {
+        try {
+            $health = Invoke-RestMethod -Uri "http://127.0.0.1:8101/api/health" -TimeoutSec 1
+            if ($health.status -eq "ok" -and $health.service -eq "tradewind") {
+                return $started
+            }
+        }
+        catch {}
+        Start-Sleep -Milliseconds 250
+    }
+    if (-not $started.HasExited) { Stop-Process -Id $started.Id -Force }
+    throw "Tradewind health check timed out"
+}
+
 function Invoke-MultipartFilePost {
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
@@ -63,23 +80,53 @@ function Invoke-MultipartFilePost {
 try {
     $env:TRADEWIND_DATA_DIR = $tempDataRoot
     $env:TRADEWIND_NO_BROWSER = "1"
-    $process = Start-Process -FilePath $exePath -WindowStyle Hidden -PassThru
+    $process = Start-PortableAppAndWait -Executable $exePath
 
-    $health = $null
-    for ($i = 0; $i -lt 240; $i++) {
-        try {
-            $health = Invoke-RestMethod -Uri "http://127.0.0.1:8101/api/health" -TimeoutSec 1
-            if ($health.status -eq "ok" -and $health.service -eq "tradewind") {
-                break
-            }
-        }
-        catch {
-            $health = $null
-        }
-        Start-Sleep -Milliseconds 250
+    $customer = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8101/api/customers" `
+        -ContentType "application/json" `
+        -Body (@{ name = "Portable Demo"; country = "香港"; phone = "+852 6123 4567" } | ConvertTo-Json)
+    if (-not $customer.ok) { throw "Portable customer fixture was not created" }
+
+    $outreachBody = @{
+        customer_id = $customer.item.id
+        channel = "whatsapp"
+        content = "Hello Portable Demo"
+        language = "en"
+    } | ConvertTo-Json
+    $created = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8101/api/outreach/jobs" `
+        -ContentType "application/json" -Body $outreachBody
+    if (-not $created.ok -or $created.item.status -ne "pending_review") {
+        throw "Outreach draft was not persisted"
     }
-    if (-not $health) {
-        throw "Tradewind health check timed out"
+
+    Stop-Process -Id $process.Id -Force
+    $process.WaitForExit()
+    $process = Start-PortableAppAndWait -Executable $exePath
+
+    $jobs = Invoke-RestMethod -Uri "http://127.0.0.1:8101/api/outreach/jobs"
+    if (@($jobs | Where-Object { $_.id -eq $created.item.id }).Count -ne 1) {
+        throw "Outreach draft did not survive restart"
+    }
+
+    $opened = Invoke-RestMethod -Method Post `
+        -Uri ("http://127.0.0.1:8101/api/outreach/jobs/" + $created.item.id + "/open-whatsapp") `
+        -ContentType "application/json" -Body "{}"
+    if (-not $opened.ok -or $opened.item.status -ne "opened" -or $opened.url -notlike "https://wa.me/*") {
+        throw "WhatsApp preparation contract failed"
+    }
+
+    $suppression = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8101/api/outreach/suppressions" `
+        -ContentType "application/json" `
+        -Body (@{ channel = "whatsapp"; recipient = "85261234567"; reason = "portable-test" } | ConvertTo-Json)
+    if (-not $suppression.ok) { throw "Suppression creation failed" }
+
+    $duplicate = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8101/api/outreach/jobs" `
+        -ContentType "application/json" -Body $outreachBody
+    if ($duplicate.ok -ne $false) {
+        throw "Suppressed recipient was queued again"
+    }
+    if ($duplicate.code -ne "suppressed") {
+        throw "Suppression rejection did not return the expected machine-readable code"
     }
 
     $start = Invoke-MultipartFilePost -Uri "http://127.0.0.1:8101/api/templates/extract" -FilePath (Join-Path $packageDirPath "README.txt")
@@ -113,6 +160,23 @@ try {
         $privacy = $diagnostic.privacy
         if ($privacy.raw_logs_included -or $privacy.keys_included -or $privacy.customer_content_included -or $privacy.photos_included -or $privacy.email_content_included) {
             throw "Diagnostic privacy contract failed"
+        }
+        if ($diagnostic.outreach.jobs_total -ne 1 -or $diagnostic.outreach.by_channel.whatsapp -ne 1) {
+            throw "Diagnostic outreach aggregates are incomplete"
+        }
+        $diagnosticText = [System.Collections.Generic.List[string]]::new()
+        foreach ($diagnosticEntry in $diagnosticArchive.Entries) {
+            if ($diagnosticEntry.Name -match '\.(json|txt)$') {
+                $entryReader = [IO.StreamReader]::new($diagnosticEntry.Open(), [Text.Encoding]::UTF8)
+                try { $diagnosticText.Add($entryReader.ReadToEnd()) | Out-Null }
+                finally { $entryReader.Dispose() }
+            }
+        }
+        $joinedDiagnostic = $diagnosticText -join "`n"
+        foreach ($privateValue in @("Portable Demo", "85261234567", "Hello Portable Demo", "portable-test")) {
+            if ($joinedDiagnostic.Contains($privateValue)) {
+                throw "Diagnostic archive leaked outreach content"
+            }
         }
     }
     finally {

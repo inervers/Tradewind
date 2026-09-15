@@ -4,10 +4,16 @@ import { ShimmerButton, SpotlightCard, useToast, Elapsed } from "../components/e
 import ProductCombo, { CustomerCombo, TemplateCombo } from "../components/Combo";
 import { CopyIcon, DownloadIcon, SparkIcon, XIcon } from "../components/Icons";
 import { resumeTask, watchTask } from "../tasks";
-import type { Customer, EmailResult, Lang, OutFormat, Product, TaskState, Template } from "../types";
+import type { ComposeSeed, Customer, EmailResult, Lang, OutFormat, Product, TaskState, Template } from "../types";
 import { formatLocation } from "../location";
 
-export default function ComposeTab() {
+interface Props {
+  seed?: ComposeSeed | null;
+  onSeedConsumed?: () => void;
+  onOpenOutreach?: () => void;
+}
+
+export default function ComposeTab({ seed, onSeedConsumed, onOpenOutreach }: Props) {
   const [customer, setCustomer] = useState("");
   const [country, setCountry] = useState("中国香港");
   const [product, setProduct] = useState("");
@@ -23,6 +29,9 @@ export default function ComposeTab() {
   const [stream, setStream] = useState("");
   const [busy, setBusy] = useState(false);
   const [taskId, setTaskId] = useState("");
+  const [selectedCustomerId, setSelectedCustomerId] = useState("");
+  const [queueBusy, setQueueBusy] = useState(false);
+  const [queuedJobId, setQueuedJobId] = useState<number | null>(null);
   const customerRefreshRef = useRef<Promise<void> | null>(null);
   const toast = useToast();
 
@@ -70,6 +79,18 @@ export default function ComposeTab() {
     void refreshCustomers();
   }, [refreshCustomers]);
 
+  useEffect(() => {
+    if (!seed) return;
+    setCustomer(seed.name);
+    setCountry(seed.country || "中国香港");
+    setExtra(seed.notes || "");
+    setFormat(seed.channel === "whatsapp" ? "whatsapp" : "email");
+    setSelectedCustomerId(seed.customerId);
+    setResult(null);
+    setQueuedJobId(null);
+    onSeedConsumed?.();
+  }, [seed, onSeedConsumed]);
+
   const generate = useCallback(async () => {
     if (!customer.trim()) {
       toast.push("先填客户名称", "error");
@@ -77,6 +98,7 @@ export default function ComposeTab() {
     }
     setBusy(true);
     setResult(null);
+    setQueuedJobId(null);
     setStream("");
     try {
       const { task_id, error } = await api.startEmail({
@@ -117,6 +139,33 @@ export default function ComposeTab() {
     downloadText(`${safe}.txt`, result.email);
   }, [result]);
 
+  const addToOutreach = useCallback(async () => {
+    if (!result || !selectedCustomerId) return;
+    setQueueBusy(true);
+    try {
+      const saved = await api.outreach.create({
+        customer_id: selectedCustomerId,
+        channel: format === "whatsapp" ? "whatsapp" : "email",
+        content: result.email,
+        language: lang,
+      });
+      if (saved.ok && saved.item) {
+        setQueuedJobId(saved.item.id);
+        toast.push("已加入外联队列，发送前仍需审核确认", "ok");
+      } else if (saved.duplicate && saved.item) {
+        setQueuedJobId(saved.item.id);
+        toast.push("该客户已有待处理任务，已打开外联队列", "info");
+        onOpenOutreach?.();
+      } else {
+        toast.push(saved.error || "加入外联队列失败", "error");
+      }
+    } catch (error) {
+      toast.push(error instanceof Error ? error.message : "加入外联队列失败", "error");
+    } finally {
+      setQueueBusy(false);
+    }
+  }, [format, lang, onOpenOutreach, result, selectedCustomerId, toast.push]);
+
   return (
     <>
       <div className="page-head">
@@ -134,11 +183,20 @@ export default function ComposeTab() {
               <label className="field-label">客户名称 *</label>
               <CustomerCombo
                 value={customer}
-                onChange={setCustomer}
+                onChange={(value) => {
+                  setCustomer(value);
+                  const selected = customers.find((item) => item.id === selectedCustomerId);
+                  if (selected && selected.name !== value) {
+                    setSelectedCustomerId("");
+                    setQueuedJobId(null);
+                  }
+                }}
                 customers={customers}
                 onOpen={refreshCustomers}
                 placeholder="输入客户名称，或从客户名单选择"
                 onSelect={(selected) => {
+                  setSelectedCustomerId(selected.id);
+                  setQueuedJobId(null);
                   setCountry(formatLocation(selected.country, selected.city) || country);
                   if (selected.notes) setExtra(selected.notes);
                 }}
@@ -146,7 +204,14 @@ export default function ComposeTab() {
             </div>
             <div className="field">
               <label className="field-label">国家 / 地区</label>
-              <input className="input" placeholder="中国香港（默认），可改其他地区" value={country} onChange={(e) => setCountry(e.target.value)} />
+              <input className="input" placeholder="中国香港（默认），可改其他地区" value={country} onChange={(e) => {
+                setCountry(e.target.value);
+                const selected = customers.find((item) => item.id === selectedCustomerId);
+                if (selected && formatLocation(selected.country, selected.city) !== e.target.value) {
+                  setSelectedCustomerId("");
+                  setQueuedJobId(null);
+                }
+              }} />
             </div>
             <div className="field">
               <label className="field-label">推荐产品</label>
@@ -265,6 +330,17 @@ export default function ComposeTab() {
                 )}
                 {result.scores?.suggestions ? <span style={{ color: "var(--amber-deep)" }}>建议：{result.scores.suggestions}</span> : null}
               </div>
+              {selectedCustomerId && (
+                <div className="compose-outreach-actions">
+                  <button className="btn btn-primary" onClick={addToOutreach} disabled={queueBusy || queuedJobId !== null}>
+                    {queueBusy ? "保存中…" : queuedJobId ? `已加入队列 #${queuedJobId}` : "加入外联队列"}
+                  </button>
+                  {queuedJobId !== null && (
+                    <button className="btn btn-ghost" onClick={onOpenOutreach}>前往外联队列</button>
+                  )}
+                  <span className="field-hint">加入队列不会自动发送，仍需逐条审核。</span>
+                </div>
+              )}
             </SpotlightCard>
           )}
         </div>

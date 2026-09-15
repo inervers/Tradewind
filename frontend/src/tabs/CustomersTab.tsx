@@ -2,44 +2,20 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import ConfirmDialog from "../components/ConfirmDialog";
 import { FadeIn, NumberTicker, useToast } from "../components/effects";
-import { PenIcon, PlusIcon, TrashIcon, UploadIcon, XIcon } from "../components/Icons";
-import type { Customer, CustomerStatus } from "../types";
+import { MailIcon, PenIcon, PlusIcon, RouteIcon, TrashIcon, UploadIcon, XIcon } from "../components/Icons";
+import type { ComposeSeed, Customer, CustomerStatus } from "../types";
 import { formatLocation } from "../location";
+import { internationalPhone, waLink } from "../outreach";
 
 const STATUS_LABEL: Record<CustomerStatus, string> = { new: "未发", sent: "已发", replied: "已回复" };
 
 const EMPTY_FORM = { name: "", country: "", city: "", email: "", website: "", phone: "", notes: "" };
 
-function internationalPhone(phone?: string, country?: string): string {
-  if (!phone) return "";
-  const raw = phone.trim();
-  const digits = raw.replace(/\D/g, "");
-  let normalized = raw;
-  if (raw.startsWith("+")) normalized = `+${digits}`;
-  else if (raw.startsWith("00")) normalized = `+${digits.slice(2)}`;
-
-  const place = (country || "").toLowerCase();
-  const isHongKong = /香港|hong\s*kong|\bhk\b/.test(place);
-  const isMainland = /中国大陆|中國大陸|大陆|大陸|mainland|\bchina\b/.test(place);
-  if (!normalized.startsWith("+") && (isHongKong || digits.startsWith("852")) && (digits.length === 8 || digits.length === 11)) {
-    normalized = `+${digits.startsWith("852") ? digits : `852${digits}`}`;
-  }
-  if (!normalized.startsWith("+") && isMainland && /^1\d{10}$/.test(digits)) normalized = `+86${digits}`;
-  if (!normalized.startsWith("+") && digits.startsWith("86") && digits.length === 13) normalized = `+${digits}`;
-
-  if (/^\+852\d{8}$/.test(normalized)) return `+852 ${normalized.slice(4)}`;
-  if (/^\+86\d{11}$/.test(normalized)) return `+86 ${normalized.slice(3)}`;
-  return normalized;
+interface Props {
+  onStartOutreach: (seed: ComposeSeed) => void;
 }
 
-function waLink(phone?: string, country?: string): string {
-  if (!phone) return "";
-  const normalized = internationalPhone(phone, country);
-  const digits = normalized.replace(/\D/g, "");
-  return normalized.startsWith("+") && digits.length >= 10 ? `https://wa.me/${digits}` : "";
-}
-
-export default function CustomersTab() {
+export default function CustomersTab({ onStartOutreach }: Props) {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [showAdd, setShowAdd] = useState(false);
   const [showImport, setShowImport] = useState(false);
@@ -377,7 +353,7 @@ export default function CustomersTab() {
                         onChange={toggleAllFiltered}
                       />
                     </th>
-                    <th>客户</th><th>国家 / 城市</th><th>邮箱</th><th>电话 / WhatsApp</th><th>状态</th><th style={{ width: 84 }} />
+                    <th>客户</th><th>国家 / 城市</th><th>邮箱</th><th>电话 / WhatsApp</th><th>状态</th><th style={{ width: 220 }}>外联 / 操作</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -446,14 +422,7 @@ export default function CustomersTab() {
                         <td className="cell-email">{c.email || "—"}</td>
                         <td>
                           {c.phone ? (
-                            <>
-                              <span className="cell-muted" style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{internationalPhone(c.phone, c.country)}</span>
-                              {waLink(c.phone, c.country) && (
-                                <a className="badge badge-wa" href={waLink(c.phone, c.country)} target="_blank" rel="noreferrer" title="在 WhatsApp 中打开">
-                                  WhatsApp
-                                </a>
-                              )}
-                            </>
+                            <span className="cell-muted" style={{ fontFamily: "var(--font-mono)", fontSize: 12 }}>{internationalPhone(c.phone, c.country)}</span>
                           ) : (
                             <span className="cell-muted">—</span>
                           )}
@@ -471,7 +440,37 @@ export default function CustomersTab() {
                           </select>
                         </td>
                         <td>
-                          <span style={{ display: "inline-flex", gap: 2 }}>
+                          <span className="customer-outreach-actions">
+                            {c.email && (
+                              <button
+                                className="btn btn-ghost btn-sm"
+                                title="生成并审核邮件"
+                                onClick={() => onStartOutreach({
+                                  customerId: c.id,
+                                  name: c.name,
+                                  country: formatLocation(c.country, c.city),
+                                  notes: c.notes || "",
+                                  channel: "email",
+                                })}
+                              >
+                                <MailIcon size={13} /> 准备邮件
+                              </button>
+                            )}
+                            {waLink(c.phone, c.country) && (
+                              <button
+                                className="btn btn-ghost btn-sm"
+                                title="生成并审核 WhatsApp 消息"
+                                onClick={() => onStartOutreach({
+                                  customerId: c.id,
+                                  name: c.name,
+                                  country: formatLocation(c.country, c.city),
+                                  notes: c.notes || "",
+                                  channel: "whatsapp",
+                                })}
+                              >
+                                <RouteIcon size={13} /> 准备 WhatsApp
+                              </button>
+                            )}
                             <button className="icon-btn" title="编辑" onClick={() => startEdit(c)}><PenIcon size={14} /></button>
                             <button className="icon-btn danger" title="删除" onClick={() => setDel(c)}><TrashIcon size={14} /></button>
                           </span>
