@@ -83,6 +83,7 @@ class OutreachStore:
             """
             CREATE TABLE IF NOT EXISTS outreach_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id TEXT DEFAULT '',
                 customer_id TEXT NOT NULL,
                 customer_name_snapshot TEXT NOT NULL,
                 channel TEXT NOT NULL CHECK(channel IN ('whatsapp', 'email')),
@@ -117,6 +118,13 @@ class OutreachStore:
                 UNIQUE(channel, normalized_recipient)
             );
             """
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(outreach_jobs)")}
+        if "workflow_id" not in columns:
+            conn.execute("ALTER TABLE outreach_jobs ADD COLUMN workflow_id TEXT DEFAULT ''")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_outreach_workflow "
+            "ON outreach_jobs(workflow_id) WHERE workflow_id <> ''"
         )
         conn.commit()
         return conn
@@ -156,6 +164,7 @@ class OutreachStore:
         recipient: str,
         subject: str,
         body: str,
+        workflow_id: str = "",
     ) -> dict:
         if channel not in {"email", "whatsapp"}:
             raise ValueError("不支持的外联渠道")
@@ -165,26 +174,43 @@ class OutreachStore:
             raise ValueError("渠道与发送方式不匹配")
         customer_id = customer_id.strip()
         customer_name = customer_name.strip()
+        workflow_id = workflow_id.strip()
         body = body.strip()
         subject = subject.strip()
         if not customer_id or not customer_name or not body:
             raise ValueError("客户和外联内容不能为空")
         normalized_recipient = normalize_recipient(channel, recipient)
+        content_hash = self._content_hash(subject, body)
         now = time.time()
         conn = self._connect()
         try:
+            if workflow_id:
+                existing = conn.execute(
+                    "SELECT * FROM outreach_jobs WHERE workflow_id=?", (workflow_id,)
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["customer_id"] == customer_id
+                        and existing["channel"] == channel
+                        and existing["recipient"] == normalized_recipient
+                        and existing["subject"] == subject
+                        and existing["content_hash"] == content_hash
+                    ):
+                        return self._job(existing)
+                    raise OutreachConflict("工作流内容与既有外联任务不一致")
             if self._is_suppressed(conn, channel, normalized_recipient):
                 raise SuppressedContact("该联系方式已加入禁止联系名单")
             try:
                 cursor = conn.execute(
                     """
                     INSERT INTO outreach_jobs (
-                        customer_id, customer_name_snapshot, channel, provider,
+                        workflow_id, customer_id, customer_name_snapshot, channel, provider,
                         sender_account_snapshot, recipient, subject, body,
                         content_hash, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?, ?)
                     """,
                     (
+                        workflow_id,
                         customer_id,
                         customer_name,
                         channel,
@@ -193,7 +219,7 @@ class OutreachStore:
                         normalized_recipient,
                         subject,
                         body,
-                        self._content_hash(subject, body),
+                        content_hash,
                         now,
                         now,
                     ),
@@ -215,6 +241,19 @@ class OutreachStore:
         if row is None:
             raise OutreachNotFound("外联任务不存在")
         return self._job(row)
+
+    def get_job_by_workflow_id(self, workflow_id: str) -> dict | None:
+        workflow_id = workflow_id.strip()
+        if not workflow_id:
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM outreach_jobs WHERE workflow_id=?", (workflow_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return self._job(row) if row else None
 
     def list_jobs(
         self,

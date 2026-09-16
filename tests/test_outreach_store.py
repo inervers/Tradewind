@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -136,3 +137,74 @@ class OutreachStoreTests(unittest.TestCase):
         self.assertEqual(rebound["provider"], "qq_smtp")
         self.assertEqual(rebound["sender_account_snapshot"], "new@qq.com")
         self.assertEqual(rebound["message_id"], "")
+
+    def test_same_workflow_returns_one_job_but_changed_payload_conflicts(self) -> None:
+        args = {
+            "workflow_id": "wf-001",
+            "customer_id": "c-003",
+            "customer_name": "Demo Center",
+            "channel": "email",
+            "provider": "gmail_smtp",
+            "sender_account": "sender@example.test",
+            "recipient": "BUYER@example.test",
+            "subject": "Demo",
+            "body": "Same body",
+        }
+        first = self.store.create_job(**args)
+        second = self.store.create_job(**args)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(first["workflow_id"], "wf-001")
+        self.assertEqual(self.store.get_job_by_workflow_id("wf-001")["id"], first["id"])
+        self.assertIsNone(self.store.get_job_by_workflow_id(""))
+
+        with self.assertRaises(OutreachConflict):
+            self.store.create_job(**{**args, "body": "Changed body"})
+
+    def test_old_outreach_table_is_migrated_without_losing_rows(self) -> None:
+        legacy_db = Path(self.tmp.name) / "legacy.db"
+        conn = sqlite3.connect(legacy_db)
+        conn.executescript(
+            """
+            CREATE TABLE outreach_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                customer_id TEXT NOT NULL,
+                customer_name_snapshot TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                sender_account_snapshot TEXT DEFAULT '',
+                recipient TEXT NOT NULL,
+                subject TEXT DEFAULT '',
+                body TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                message_id TEXT DEFAULT '',
+                status TEXT NOT NULL,
+                provider_reference TEXT DEFAULT '',
+                error_code TEXT DEFAULT '',
+                error_summary TEXT DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                opened_at REAL,
+                submitted_at REAL,
+                replied_at REAL
+            );
+            INSERT INTO outreach_jobs (
+                customer_id, customer_name_snapshot, channel, provider, recipient,
+                body, content_hash, status, created_at, updated_at
+            ) VALUES ('old-1', 'Old Clinic', 'email', 'gmail_smtp',
+                      'old@example.test', 'Old body', 'hash', 'accepted', 1, 1);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        migrated = OutreachStore(legacy_db)
+        row = migrated.get_job(1)
+        conn = sqlite3.connect(legacy_db)
+        columns = {item[1] for item in conn.execute("PRAGMA table_info(outreach_jobs)")}
+        count = conn.execute("SELECT COUNT(*) FROM outreach_jobs").fetchone()[0]
+        conn.close()
+
+        self.assertIn("workflow_id", columns)
+        self.assertEqual(row["customer_name_snapshot"], "Old Clinic")
+        self.assertEqual(row["workflow_id"], "")
+        self.assertEqual(count, 1)
