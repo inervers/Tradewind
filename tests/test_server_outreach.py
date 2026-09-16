@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import server
-from app import config as app_config
+from app import config as app_config, memory
 from app.outreach_smtp import SendOutcome
 from app.outreach_store import OutreachStore
 
@@ -58,6 +59,25 @@ class DormantThread:
 
     def start(self) -> None:
         type(self).starts += 1
+
+
+class FakeApprovalWorkflow:
+    def __init__(self) -> None:
+        self.resumes: list[tuple[str, str, int]] = []
+
+    def resume_approval(
+        self, workflow_id: str, action: str, outreach_job_id: int = 0
+    ) -> dict:
+        self.resumes.append((workflow_id, action, outreach_job_id))
+        memory.save_email_once(
+            workflow_id,
+            "Demo Clinic",
+            "香港",
+            "Laser",
+            EMAIL_CONTENT,
+            language="en",
+        )
+        return {"status": "done"}
 
 
 class ServerOutreachTests(unittest.TestCase):
@@ -118,6 +138,41 @@ class ServerOutreachTests(unittest.TestCase):
         self.assertEqual(item["recipient"], "buyer@example.test")
         self.assertEqual(item["sender_account_snapshot"], "sender@example.test")
         self.assertEqual(item["subject"], "Demo")
+
+    def test_workflow_approval_is_resumed_idempotently(self) -> None:
+        workflow = FakeApprovalWorkflow()
+        request = server.OutreachCreateRequest(
+            customer_id="c-001",
+            channel="email",
+            content=EMAIL_CONTENT,
+            workflow_id="wf-001",
+        )
+        with (
+            patch.object(server, "get_email_outreach_config", return_value=EMAIL_CONFIG),
+            patch.object(server, "get_company_profile", return_value=PROFILE),
+            patch.object(server, "_EMAIL_WORKFLOW", workflow),
+            patch.object(memory, "MEMORY_DB", self.db),
+        ):
+            first = server.api_outreach_create(request)
+            second = server.api_outreach_create(request)
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(first["item"]["id"], second["item"]["id"])
+        self.assertEqual(
+            workflow.resumes,
+            [("wf-001", "approve", first["item"]["id"])] * 2,
+        )
+        conn = sqlite3.connect(self.db)
+        outreach_count = conn.execute(
+            "SELECT COUNT(*) FROM outreach_jobs WHERE workflow_id='wf-001'"
+        ).fetchone()[0]
+        history_count = conn.execute(
+            "SELECT COUNT(*) FROM emails WHERE workflow_id='wf-001'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(outreach_count, 1)
+        self.assertEqual(history_count, 1)
 
     def test_create_whatsapp_job_normalizes_customer_phone(self) -> None:
         result = server.api_outreach_create(

@@ -46,6 +46,7 @@ from app.config import (
 )
 from app.credential_store import CredentialStore, CredentialUnavailable
 from app.email_agent import GenerationCancelled, generate_email
+from app.email_workflow import WorkflowContext, build_sqlite_workflow
 from app.crawler.progress import use_progress_sink
 from app.crawler.result_utils import matches_targets
 from app.memory import delete_email, delete_emails, recent_emails
@@ -233,6 +234,7 @@ def _parse_product_doc(text: str) -> list[dict]:
 # ---------- 模型 ----------
 
 class EmailRequest(BaseModel):
+    customer_id: str = ""
     customer: str
     country: str = ""
     product: str = "医美设备"
@@ -300,6 +302,7 @@ class OutreachCreateRequest(BaseModel):
     channel: str
     content: str
     language: str = "en"
+    workflow_id: str = ""
 
 
 class OutreachContentRequest(BaseModel):
@@ -702,6 +705,14 @@ def api_email(req: EmailRequest) -> EmailResponse:
 
 TASKS: dict[str, dict] = {}
 _task_lock = threading.Lock()
+_EMAIL_WORKFLOW = None
+
+
+def _email_workflow():
+    global _EMAIL_WORKFLOW
+    if _EMAIL_WORKFLOW is None:
+        _EMAIL_WORKFLOW = build_sqlite_workflow(DATA_DIR / "tradewind_workflows.db")
+    return _EMAIL_WORKFLOW
 
 
 def _new_task(total: int) -> str:
@@ -739,6 +750,13 @@ def _append_stream(task_id: str, chunk: str) -> None:
             task["stream"] = task.get("stream", "") + chunk
 
 
+def _reset_stream(task_id: str) -> None:
+    with _task_lock:
+        task = TASKS.get(task_id)
+        if task:
+            task["stream"] = ""
+
+
 # --- 单封 ---
 
 @app.post("/api/email/start")
@@ -747,19 +765,44 @@ def api_email_start(req: EmailRequest) -> dict:
     template_record = _find_template(req.template_id)
     if req.template_id and template_record is None:
         return {"task_id": "", "error": "所选话术模板不存在，请刷新后重试"}
+    customer_id = req.customer_id.strip()
+    if customer_id:
+        customer = _find_customer_by_id(customer_id)
+        if customer is None:
+            return {"task_id": "", "error": "客户不存在，请刷新后重试"}
+        if str(customer.get("name", "")).strip() != req.customer.strip():
+            return {"task_id": "", "error": "客户信息已变化，请刷新后重试"}
     task_id = _new_task(1)
+    workflow = _email_workflow()
 
     def execute() -> None:
         try:
-            result = generate_email(
-                req.customer, req.country, req.product,
-                judge=req.judge, verbose=False, extra=req.extra,
-                cancel_check=lambda: _cancelled(task_id),
-                stream_callback=lambda c: _append_stream(task_id, c),
-                language=req.language, format_=req.format,
-                template_record=template_record,
+            projection = workflow.start(
+                task_id,
+                {
+                    "customer_id": customer_id,
+                    "customer": req.customer,
+                    "country": req.country,
+                    "product": req.product,
+                    "extra": req.extra,
+                    "judge": req.judge,
+                    "language": req.language,
+                    "format": req.format,
+                    "template_record": template_record,
+                    "company_profile": get_company_profile(),
+                },
+                WorkflowContext(
+                    cancel_check=lambda: _cancelled(task_id),
+                    stream_callback=lambda chunk: _append_stream(task_id, chunk),
+                    reset_stream_callback=lambda: _reset_stream(task_id),
+                ),
             )
-            _finish(task_id, "done", result=result, done=1)
+            status = str(projection.get("status") or "done")
+            _finish(
+                task_id,
+                status,
+                **{key: value for key, value in projection.items() if key != "status"},
+            )
         except GenerationCancelled:
             _finish(task_id, "cancelled")
         except Exception as exc:  # noqa: BLE001
@@ -838,7 +881,10 @@ def api_batch(req: BatchRequest) -> dict:
 def api_task(task_id: str) -> dict:
     task = TASKS.get(task_id)
     if not task:
-        return {"status": "not_found"}
+        try:
+            return _email_workflow().get_task_projection(task_id)
+        except Exception:  # noqa: BLE001 - 查询失败不暴露本地数据库细节
+            return {"status": "not_found"}
     return task
 
 
@@ -2247,7 +2293,21 @@ def api_outreach_create(req: OutreachCreateRequest) -> dict:
             recipient=recipient,
             subject=subject,
             body=body,
+            workflow_id=req.workflow_id,
         )
+        if req.workflow_id.strip():
+            try:
+                _email_workflow().resume_approval(
+                    req.workflow_id.strip(),
+                    action="approve",
+                    outreach_job_id=int(item["id"]),
+                )
+            except Exception:  # noqa: BLE001 - 队列已落库，隐藏工作流内部错误
+                return {
+                    "ok": False,
+                    "item": item,
+                    "error": "草稿已入队，但工作流保存失败，请重试",
+                }
         return {"ok": True, "item": item}
     except OutreachConflict:
         return {
