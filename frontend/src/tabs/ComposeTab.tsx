@@ -3,7 +3,7 @@ import { api, copyText, downloadText } from "../api";
 import { ShimmerButton, SpotlightCard, useToast, Elapsed } from "../components/effects";
 import ProductCombo, { CustomerCombo, TemplateCombo } from "../components/Combo";
 import { CopyIcon, DownloadIcon, SparkIcon, XIcon } from "../components/Icons";
-import { resumeTask, watchTask } from "../tasks";
+import { currentTaskId, forgetTask, resumeTask, watchTask } from "../tasks";
 import type { ComposeSeed, Customer, EmailResult, Lang, OutFormat, Product, TaskState, Template } from "../types";
 import { formatLocation } from "../location";
 
@@ -54,6 +54,9 @@ export default function ComposeTab({ seed, onSeedConsumed, onOpenOutreach }: Pro
     else if (t.status === "done") {
       setBusy(false);
       setResult(t.result as EmailResult | null);
+      if (t.result?.customer_id) setSelectedCustomerId(t.result.customer_id);
+      if (t.result?.language) setLang(t.result.language);
+      if (t.result?.format) setFormat(t.result.format);
       const ok = !t.result?.issues?.length;
       toast.push(ok ? "生成完成，自检通过" : "生成完成，有自检提示", ok ? "ok" : "info");
     } else if (t.status === "cancelled") {
@@ -62,12 +65,17 @@ export default function ComposeTab({ seed, onSeedConsumed, onOpenOutreach }: Pro
     } else if (t.status === "error") {
       setBusy(false);
       toast.push(t.error || "生成失败", "error");
+    } else if (t.status === "not_found") {
+      setBusy(false);
+      setTaskId("");
+      forgetTask("compose");
     }
   }, [toast.push]);
 
   // 挂载时恢复：生成中途切走再切回，继续显示流式与结果
   useEffect(() => {
     const unsub = resumeTask("compose", handleTask);
+    setTaskId(currentTaskId("compose"));
     return () => {
       unsub?.();
     };
@@ -102,6 +110,7 @@ export default function ComposeTab({ seed, onSeedConsumed, onOpenOutreach }: Pro
     setStream("");
     try {
       const { task_id, error } = await api.startEmail({
+        customer_id: selectedCustomerId || undefined,
         customer: customer.trim(),
         country: country.trim(),
         product: product.trim(),
@@ -118,7 +127,7 @@ export default function ComposeTab({ seed, onSeedConsumed, onOpenOutreach }: Pro
       setBusy(false);
       toast.push(e instanceof Error ? e.message : "启动失败", "error");
     }
-  }, [customer, country, product, extra, judge, lang, format, templateId, handleTask, toast.push]);
+  }, [customer, country, product, extra, judge, lang, format, templateId, selectedCustomerId, handleTask, toast.push]);
 
   const stop = useCallback(async () => {
     if (!taskId) return;
@@ -148,6 +157,7 @@ export default function ComposeTab({ seed, onSeedConsumed, onOpenOutreach }: Pro
         channel: format === "whatsapp" ? "whatsapp" : "email",
         content: result.email,
         language: lang,
+        workflow_id: result.workflow_id,
       });
       if (saved.ok && saved.item) {
         setQueuedJobId(saved.item.id);

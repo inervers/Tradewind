@@ -77,7 +77,7 @@ export const api = {
   email: (p: { customer: string; country?: string; product?: string; extra?: string; judge?: boolean; language?: Lang; format?: OutFormat }, signal?: AbortSignal) =>
     post<EmailResult>("/api/email", p, signal),
 
-  startEmail: (p: { customer: string; country?: string; product?: string; extra?: string; judge?: boolean; language?: Lang; format?: OutFormat; template_id?: string }) =>
+  startEmail: (p: { customer_id?: string; customer: string; country?: string; product?: string; extra?: string; judge?: boolean; language?: Lang; format?: OutFormat; template_id?: string }) =>
     post<{ task_id: string; error?: string }>("/api/email/start", p),
   cancelTask: (taskId: string) =>
     post<{ ok: boolean; error?: string }>(`/api/email/tasks/${taskId}/cancel`, {}),
@@ -131,7 +131,7 @@ export const api = {
       const query = params.toString();
       return req<OutreachJob[]>(`/api/outreach/jobs${query ? `?${query}` : ""}`, { cache: "no-store" });
     },
-    create: (payload: { customer_id: string; channel: OutreachChannel; content: string; language: Lang }) =>
+    create: (payload: { customer_id: string; channel: OutreachChannel; content: string; language: Lang; workflow_id?: string }) =>
       post<{ ok: boolean; item?: OutreachJob; duplicate?: boolean; error?: string }>("/api/outreach/jobs", payload),
     update: (id: number, payload: { subject: string; body: string }) =>
       req<{ ok: boolean; item?: OutreachJob; error?: string }>(`/api/outreach/jobs/${id}`, {

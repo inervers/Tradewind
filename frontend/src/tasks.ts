@@ -12,6 +12,30 @@ type Fetcher<T extends TaskLike> = (id: string) => Promise<T>;
 const subs = new Map<string, Set<(t: unknown) => void>>();
 const timers = new Map<string, number>();
 const lastByKind = new Map<string, string>();
+const STORAGE_PREFIX = "tradewind.task.";
+
+function rememberTask(kind: string, taskId: string): void {
+  lastByKind.set(kind, taskId);
+  if (kind !== "compose") return;
+  try {
+    window.localStorage.setItem(`${STORAGE_PREFIX}${kind}`, taskId);
+  } catch {
+    // 隐私模式或受限浏览器可能禁用 storage；内存恢复仍可用。
+  }
+}
+
+function storedTask(kind: string): string {
+  if (kind !== "compose") return "";
+  try {
+    return window.localStorage.getItem(`${STORAGE_PREFIX}${kind}`) || "";
+  } catch {
+    return "";
+  }
+}
+
+function finished(status: string): boolean {
+  return status === "done" || status === "cancelled" || status === "error" || status === "not_found";
+}
 
 /** 监听一个任务。返回解除监听函数（不停止轮询）。 */
 export function watchTask<T extends TaskLike = TaskState>(
@@ -20,7 +44,7 @@ export function watchTask<T extends TaskLike = TaskState>(
   listener: Listener<T>,
   fetcher: Fetcher<T> = api.task as unknown as Fetcher<T>,
 ): () => void {
-  lastByKind.set(kind, taskId);
+  rememberTask(kind, taskId);
   if (!subs.has(taskId)) subs.set(taskId, new Set());
   subs.get(taskId)!.add(listener as (t: unknown) => void);
 
@@ -30,8 +54,8 @@ export function watchTask<T extends TaskLike = TaskState>(
       .then((t) => {
         if (!subs.has(taskId)) return;
         subs.get(taskId)!.forEach((l) => l(t as unknown));
-        const finished = t.status === "done" || t.status === "cancelled" || t.status === "error";
-        if (finished) return; // 已结束不再建轮询
+        if (t.status === "not_found") forgetTask(kind, taskId);
+        if (finished(t.status)) return; // 已结束不再建轮询
         if (timers.has(taskId)) return;
         timers.set(
           taskId,
@@ -44,9 +68,10 @@ export function watchTask<T extends TaskLike = TaskState>(
             }
             if (!subs.has(taskId)) return;
             subs.get(taskId)!.forEach((l) => l(t2 as unknown));
-            if (t2.status === "done" || t2.status === "cancelled" || t2.status === "error") {
+            if (finished(t2.status)) {
               window.clearInterval(timers.get(taskId)!);
               timers.delete(taskId);
+              if (t2.status === "not_found") forgetTask(kind, taskId);
             }
           }, 1000),
         );
@@ -67,7 +92,7 @@ export function resumeTask<T extends TaskLike = TaskState>(
   listener: Listener<T>,
   fetcher: Fetcher<T> = api.task as unknown as Fetcher<T>,
 ): (() => void) | null {
-  const id = lastByKind.get(kind);
+  const id = lastByKind.get(kind) || storedTask(kind);
   if (!id) return null;
   return watchTask(kind, id, listener, fetcher);
 }
@@ -80,6 +105,15 @@ export function currentTaskId(kind: string): string {
 /** 主动清空某类任务的当前工作区引用；后端历史记录不受影响。 */
 export function forgetTask(kind: string, taskId?: string): void {
   const current = lastByKind.get(kind);
-  if (!current || (taskId && current !== taskId)) return;
-  lastByKind.delete(kind);
+  if (current && (!taskId || current === taskId)) lastByKind.delete(kind);
+  if (kind === "compose") {
+    try {
+      const stored = window.localStorage.getItem(`${STORAGE_PREFIX}${kind}`);
+      if (!taskId || !stored || stored === taskId) {
+        window.localStorage.removeItem(`${STORAGE_PREFIX}${kind}`);
+      }
+    } catch {
+      // storage 不可用时无需阻断页面操作。
+    }
+  }
 }

@@ -45,6 +45,8 @@ export interface Scores {
 }
 
 export interface EmailResult {
+  workflow_id?: string;
+  customer_id?: string;
   customer: string;
   country: string;
   product: string;
@@ -110,6 +112,7 @@ export type OutreachStatus =
 
 export interface OutreachJob {
   id: number;
+  workflow_id?: string;
   customer_id: string;
   customer_name_snapshot: string;
   channel: OutreachChannel;
