@@ -40,6 +40,13 @@ def _connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE emails ADD COLUMN language TEXT DEFAULT 'zh-hant'")
     if "format" not in cols:
         conn.execute("ALTER TABLE emails ADD COLUMN format TEXT DEFAULT 'email'")
+    if "workflow_id" not in cols:
+        conn.execute("ALTER TABLE emails ADD COLUMN workflow_id TEXT DEFAULT ''")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_emails_workflow "
+        "ON emails(workflow_id) WHERE workflow_id <> ''"
+    )
+    conn.commit()
     return conn
 
 
@@ -53,6 +60,33 @@ def save_email(customer: str, country: str, product: str, email: str,
     )
     conn.commit()
     conn.close()
+
+
+def save_email_once(workflow_id: str, customer: str, country: str, product: str,
+                    email: str, score: float = 0, language: str = "zh-hant",
+                    format_: str = "email") -> int:
+    """按工作流幂等保存开发信，返回已有或新建的记录 ID。"""
+    workflow_id = workflow_id.strip()
+    if not workflow_id:
+        raise ValueError("workflow_id 不能为空")
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO emails "
+            "(workflow_id, customer, country, product, email, score, language, format, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (workflow_id, customer, country, product, email[:2000], score,
+             language, format_, time.time()),
+        )
+        row = conn.execute(
+            "SELECT id FROM emails WHERE workflow_id=?", (workflow_id,)
+        ).fetchone()
+        conn.commit()
+        if row is None:
+            raise RuntimeError("开发信历史保存失败")
+        return int(row[0])
+    finally:
+        conn.close()
 
 
 def recent_emails(limit: int = 10) -> list[dict]:
