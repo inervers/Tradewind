@@ -15,6 +15,12 @@ try:
 except Exception:
     pass
 
+for package in ("langgraph", "langgraph.checkpoint.sqlite"):
+    try:
+        hiddenimports += collect_submodules(package)
+    except Exception:
+        pass
+
 for package in ("rapidocr_onnxruntime",):
     try:
         package_datas, package_binaries, package_hidden = collect_all(package)
