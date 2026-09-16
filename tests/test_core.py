@@ -23,7 +23,15 @@ try:
 except ImportError:
     sys.modules.setdefault("httpx", types.ModuleType("httpx"))
 
-from app.email_agent import _ensure_signature, _parse_judge_scores, _render, _rule_check, generate_email
+from app.email_agent import (
+    _ensure_signature,
+    _parse_judge_scores,
+    _render,
+    _rule_check,
+    generate_draft,
+    generate_email,
+    judge_generation_draft,
+)
 from app.task_utils import TASK_TTL_SECONDS, prune_finished_tasks
 from app.tools.search import LocalSearchTool
 
@@ -62,6 +70,41 @@ class LocalSearchIsolationTests(unittest.TestCase):
 
 
 class EmailRuleTests(unittest.TestCase):
+    def test_retry_prompt_contains_previous_issues_and_draft(self) -> None:
+        context = {
+            "customer": "Glow",
+            "country": "HK",
+            "product": "Laser",
+            "extra": "",
+            "language": "en",
+            "format": "email",
+            "products": [{"title": "Laser", "content": "Diode-808"}],
+            "emails": [],
+            "company_profile": {"sender_name": "Demo", "company_name": "DemoMed"},
+            "templates_used": [],
+        }
+        fake_llm = unittest.mock.Mock()
+        with patch("app.email_agent.build_llm", return_value=fake_llm), patch(
+            "app.email_agent._stream_email", return_value=("Fixed", 5)
+        ) as stream:
+            draft, tokens = generate_draft(
+                context,
+                retry_issues=["缺少明确行动号召"],
+                previous_draft="Old draft",
+            )
+        prompt = stream.call_args.args[1]
+        self.assertIn("缺少明确行动号召", prompt)
+        self.assertIn("Old draft", prompt)
+        self.assertEqual((draft, tokens), ("Fixed", 5))
+
+    def test_disabled_judge_does_not_build_llm(self) -> None:
+        with patch("app.email_agent.build_llm") as build:
+            self.assertEqual(
+                judge_generation_draft("Draft", enabled=False),
+                (None, "disabled"),
+            )
+        build.assert_not_called()
+
     def test_judge_scores_require_numeric_fields_in_range(self) -> None:
         valid = '{"personalization": 4, "value_prop": 3.5, "clarity": 5, "cta": 4, "overall": 4, "suggestions": "加一条 CTA"}'
         scores, status = _parse_judge_scores(valid)

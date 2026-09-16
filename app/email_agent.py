@@ -271,6 +271,115 @@ def _stream_email(llm, prompt: str, cancel_check=None, stream_callback=None) -> 
     return "".join(parts), tokens
 
 
+def retrieve_generation_context(
+    customer: str,
+    country: str,
+    product: str,
+    extra: str,
+    language: str,
+    format_: str,
+    template_record: dict | None = None,
+    company_profile: dict[str, str] | None = None,
+) -> dict:
+    """收集生成所需的本地资料，结果只包含可持久化的普通数据。"""
+    products = _local_records(product, 3, ("products.json",))
+    if not products:
+        products = _local_records("产品", 3, ("products.json",))
+    emails = ([{
+        "title": str(template_record.get("title") or "指定话术模板"),
+        "content": str(template_record.get("content") or ""),
+        "source": str(template_record.get("source") or "local"),
+    }] if template_record else _local_records("邮件 开发信 模板", 2, ("emails.json",)))
+    return {
+        "customer": customer,
+        "country": country,
+        "product": product,
+        "extra": extra,
+        "language": language,
+        "format": format_,
+        "products": products,
+        "emails": emails,
+        "template_record": template_record,
+        "company_profile": company_profile or get_company_profile(),
+        "templates_used": [e.get("title", "") for e in emails if e.get("title")],
+    }
+
+
+def generate_draft(
+    context: dict,
+    *,
+    retry_issues: list[str],
+    previous_draft: str,
+    cancel_check=None,
+    stream_callback=None,
+) -> tuple[str, int]:
+    """根据检索上下文生成一版草稿；重试时仅附加有限的修正要求。"""
+    template_record = context.get("template_record")
+    emails = context.get("emails", [])
+    products = context.get("products", [])
+    prod_block = _render(products, 1200) or "（产品库暂无匹配，按医美设备通用卖点撰写）"
+    email_block = _render(emails, 4000 if template_record else 800) or "（暂无历史邮件，按行业惯例撰写）"
+    template_rule = (
+        "【指定模板要求】用户已明确选择上述模板。保留模板的核心信息、表达顺序和关键话术，"
+        "只针对当前客户与产品做必要的个性化调整，不要忽略用户后来补充的段落。"
+        if template_record else
+        "【模板使用方式】以上内容仅作语气与结构参考，按当前客户重新组织。"
+    )
+    prompt = GENERATE_PROMPT.format(
+        customer=context["customer"],
+        country=context["country"],
+        extra=context.get("extra") or "（无）",
+        products=prod_block,
+        emails=email_block,
+        template_rule=template_rule,
+        fmt_inst=FORMAT_INSTRUCTIONS.get(
+            context.get("format", "email"), FORMAT_INSTRUCTIONS["email"]
+        ),
+        lang_inst=LANG_INSTRUCTIONS.get(
+            context.get("language", "zh-hant"), LANG_INSTRUCTIONS["zh-hant"]
+        ),
+    )
+    if retry_issues and previous_draft:
+        issues = "；".join(str(issue) for issue in retry_issues)
+        prompt += (
+            "\n\n【上一版修正要求】\n"
+            f"以下是确定性规则检查发现的问题：{issues}\n"
+            "请只修正这些问题，保留正确事实，不要虚构新数据。\n\n"
+            "【上一版草稿】\n"
+            f"{previous_draft}"
+        )
+    llm = build_llm(temperature=0.7)
+    return _stream_email(llm, prompt, cancel_check, stream_callback)
+
+
+def check_generation_draft(draft: str, context: dict) -> list[str]:
+    """对草稿执行不消耗 token 的确定性规则检查。"""
+    products = context.get("products", [])
+    return _rule_check(
+        draft,
+        re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", context.get("product", "")),
+        _extract_identifiers(products),
+        language=context.get("language", "zh-hant"),
+        format_=context.get("format", "email"),
+    )
+
+
+def judge_generation_draft(
+    draft: str,
+    enabled: bool,
+    cancel_check=None,
+) -> tuple[dict | None, str]:
+    """可选的 LLM 质量评分；失败不阻断主流程。"""
+    if not enabled or (cancel_check and cancel_check()):
+        return None, "disabled"
+    try:
+        judge_llm = build_llm(temperature=0.0)
+        response = judge_llm.invoke(JUDGE_PROMPT.format(email=draft))
+        return _parse_judge_scores(getattr(response, "content", ""))
+    except Exception:  # noqa: BLE001 - 打分失败不影响主流程
+        return None, "unavailable"
+
+
 def generate_email(
     customer: str,
     country: str,
@@ -293,58 +402,26 @@ def generate_email(
     format_: "email"（正式开发信）|"whatsapp"（手机短消息）。
     """
     t0 = time.time()
-
-    # ① 检索卖点 + 话术（纯本地：产品资料/话术模板都存在本地 JSON 库）
-    products = _local_records(product, 3, ("products.json",))
-    if not products:
-        # 没指定产品/关键词检索不到 → 取全部设备（tags 都含「产品」）
-        products = _local_records("产品", 3, ("products.json",))
-    # 批量生成可固定使用用户选中的模板；未指定时保持原有自动检索行为。
-    emails = ([{
-        "title": str(template_record.get("title") or "指定话术模板"),
-        "content": str(template_record.get("content") or ""),
-        "source": str(template_record.get("source") or "local"),
-    }] if template_record else _local_records("邮件 开发信 模板", 2, ("emails.json",)))
-
-    # ② LLM 生成
-    prod_block = _render(products, 1200) or "（产品库暂无匹配，按医美设备通用卖点撰写）"
-    email_block = _render(emails, 4000 if template_record else 800) or "（暂无历史邮件，按行业惯例撰写）"
-    template_rule = (
-        "【指定模板要求】用户已明确选择上述模板。保留模板的核心信息、表达顺序和关键话术，"
-        "只针对当前客户与产品做必要的个性化调整，不要忽略用户后来补充的段落。"
-        if template_record else
-        "【模板使用方式】以上内容仅作语气与结构参考，按当前客户重新组织。"
+    context = retrieve_generation_context(
+        customer,
+        country,
+        product,
+        extra,
+        language,
+        format_,
+        template_record,
+        company_profile,
     )
-
-    llm = build_llm(temperature=0.7)
-    prompt = GENERATE_PROMPT.format(
-        customer=customer, country=country, extra=extra or "（无）",
-        products=prod_block, emails=email_block,
-        template_rule=template_rule,
-        fmt_inst=FORMAT_INSTRUCTIONS.get(format_, FORMAT_INSTRUCTIONS["email"]),
-        lang_inst=LANG_INSTRUCTIONS.get(language, LANG_INSTRUCTIONS["zh-hant"]),
+    email, tokens = generate_draft(
+        context,
+        retry_issues=[],
+        previous_draft="",
+        cancel_check=cancel_check,
+        stream_callback=stream_callback,
     )
-    email, tokens = _stream_email(llm, prompt, cancel_check, stream_callback)
-    email = _ensure_signature(email, company_profile or get_company_profile(), format_)
-
-    # ③ 规则自检（按语言 + 形态）
-    identifiers = _extract_identifiers(products)
-    issues = _rule_check(
-        email, re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", product),
-        identifiers, language=language, format_=format_,
-    )
-
-    # ④ LLM-as-judge 打分（取消后跳过）
-    scores = None
-    judge_status = "disabled"
-    if judge and not (cancel_check and cancel_check()):
-        try:
-            judge_llm = build_llm(temperature=0.0)
-            jresp = judge_llm.invoke(JUDGE_PROMPT.format(email=email))
-            scores, judge_status = _parse_judge_scores(getattr(jresp, "content", ""))
-        except Exception:  # noqa: BLE001 - 打分失败不影响主流程
-            scores = None
-            judge_status = "unavailable"
+    email = _ensure_signature(email, context["company_profile"], format_)
+    issues = check_generation_draft(email, context)
+    scores, judge_status = judge_generation_draft(email, judge, cancel_check)
 
     # 取消检查（生成完成但用户在保存前点停）
     if cancel_check and cancel_check():
@@ -357,7 +434,10 @@ def generate_email(
     save_email(customer, country, product, email, score, language, format_)
 
     if verbose:
-        print(f"[tradewind] 产品{len(products)}条/邮件{len(emails)}条 tokens={tokens} time={elapsed:.1f}s")
+        print(
+            f"[tradewind] 产品{len(context['products'])}条/邮件{len(context['emails'])}条 "
+            f"tokens={tokens} time={elapsed:.1f}s"
+        )
         print(f"[tradewind] 规则自检: {'通过' if not issues else issues}")
 
     return {
@@ -373,7 +453,7 @@ def generate_email(
         "language": language,
         "format": format_,
         # 生成时实际引用了哪份话术模板（前端展示“参考话术”）
-        "templates_used": [e.get("title", "") for e in emails if e.get("title")],
+        "templates_used": context["templates_used"],
     }
 
 
