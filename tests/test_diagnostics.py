@@ -23,12 +23,16 @@ class DiagnosticExportTests(unittest.TestCase):
             products = data_dir / "products.json"
             templates = data_dir / "emails.json"
             memory = data_dir / "tradewind_memory.db"
+            workflow_db = data_dir / "tradewind_workflows.db"
             customers.write_text(
                 json.dumps([{"name": "Private Clinic", "email": "owner@example.test"}]),
                 encoding="utf-8",
             )
             products.write_text("[]", encoding="utf-8")
             templates.write_text("[]", encoding="utf-8")
+            workflow_db.write_text(
+                "checkpoint-private@example.test", encoding="utf-8"
+            )
             store = OutreachStore(memory)
             store.create_job(
                 customer_id="c-private",
@@ -98,7 +102,8 @@ class DiagnosticExportTests(unittest.TestCase):
 
             with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
                 report = json.loads(archive.read("diagnostic.json"))
-                all_content = b"\n".join(archive.read(name) for name in archive.namelist()).decode("utf-8")
+                payload = b"\n".join(archive.read(name) for name in archive.namelist())
+                all_content = payload.decode("utf-8")
 
             self.assertEqual(report["data"]["customers"]["item_count"], 1)
             self.assertEqual(report["data"]["crawler_photos"]["photo_count"], 1)
@@ -124,6 +129,8 @@ class DiagnosticExportTests(unittest.TestCase):
                 temp_dir,
             ):
                 self.assertNotIn(private_value, all_content)
+            self.assertNotIn(b"checkpoint-private@example.test", payload)
+            self.assertNotIn(b"tradewind_workflows.db", payload)
 
 
 if __name__ == "__main__":

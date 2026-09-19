@@ -48,17 +48,24 @@ flowchart LR
     C --> D[产品与话术检索]
     D --> E[LLM 生成]
     E --> F[规则自检]
+    F -->|有问题且未重试| E
     F --> G[可选 LLM-as-judge]
-    G --> H[人工审核并加入外联队列]
-    H --> I[逐条确认发送与本地状态记录]
+    G --> H[LangGraph 暂停等待人工确认]
+    H -->|加入外联队列| I[幂等保存生成历史]
+    I --> J[逐条确认发送与本地状态记录]
 ```
+
+单封写信使用 LangGraph checkpoint 保存 `retrieve → generate → rule_check → judge → interrupt → persist`
+状态。规则检查最多触发一次定向重写；选择客户的草稿在“加入外联队列”前不会写入生成历史，
+重启后仍可按同一个 task id 恢复。批量写信、爬虫、OCR 和照片识别继续使用原有任务机制，
+没有为了技术统一强行迁移到 LangGraph，这是本次最小重构的明确边界。
 
 ## 核心功能
 
 | 模块 | 能力 |
 |---|---|
 | **爬虫**（`app/crawler/`） | Google Maps 搜美容院（medspa/beauty clinic…）→ 滚动批量收集 → 详情页挖邮箱/电话/WhatsApp → 照片视觉识别仪器品牌 → **缺品分析**（"缺什么推什么"）→ 客户名单 CSV |
-| **写信**（`app/email_agent.py`） | 本地产品库检索 → 按所选话术模板生成 → 规则自检（零 token）→ 可选 LLM-as-judge 四维打分 → SQLite history/evaluation log。单封/批量、邮件/WhatsApp、流式输出与后台取消 |
+| **写信**（`app/email_agent.py`、`app/email_workflow.py`） | 本地产品库检索 → 按所选话术模板生成 → 规则自检（零 token，至多重试一次）→ 可选 LLM-as-judge → LangGraph 人工确认与 SQLite checkpoint。批量路径保持原实现 |
 | **外联队列** | 生成结果先保存为待审核任务；WhatsApp 仅准备 `wa.me` 链接并由人工确认结果，QQ/Gmail 邮件逐封二次确认后才通过 SMTP 提交；重启后任务仍可恢复 |
 | **话术模板** | 历史邮件（脱敏）或文档原文导入；生成时显式选择，正文完整参与提示词，不再由导入模型改写 |
 | **照片库** | 按店铺管理爬虫照片，重命名/删除店铺，手动导入多张图片，选择图片重新识别并查看实际 provider/model |

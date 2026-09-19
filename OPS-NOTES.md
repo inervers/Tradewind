@@ -216,3 +216,13 @@ Tradewind 仅保留本地关键词检索实现，不再包含 RAGNEXUS 配置或
 - 诊断包只输出外联任务总数、渠道/状态计数、邮箱 provider 与是否填写账号；不得读取凭据，也不得包含客户 ID/名称、收发件地址、主题、正文、Message-ID、禁止联系明细、数据库路径或原始异常。
 - Portable 冒烟使用临时 `TRADEWIND_DATA_DIR` 和虚构客户，覆盖入队、重启持久化、链接准备、禁止联系及诊断脱敏；它不打开 WhatsApp 页面、不配置邮箱、不连接 SMTP，也不发送真实消息。
 - 本功能不提供陌生开发合规保证。地区法律、平台政策、客户授权、退订处理和发送频率仍由使用者负责；Gmail OAuth、IMAP、自动回复、定时发送、附件和送达/阅读追踪继续留在范围外。
+
+## 18. 单封写信 LangGraph 最小重构（2026-09-16）
+
+- 只迁移 `/api/email/start` 的单封生成链路；同步 `/api/email`、批量写信、爬虫、OCR 和照片任务继续使用原实现，避免扩大回归范围。
+- 节点顺序为 `retrieve → generate → rule_check → judge → human_approval → persist`。规则未通过时只允许再生成一次，因此总生成次数最多两次。
+- `task_id == workflow_id == thread_id`。checkpoint 独立保存在 `data/tradewind_workflows.db`，前端 localStorage 只保存 compose task id，不保存正文、客户资料或凭据。
+- 有 `customer_id` 的草稿在 LangGraph `interrupt` 处暂停；界面的“加入外联队列”就是 approve 动作。自由输入、没有客户 ID 的草稿保持生成完成即保存的兼容行为。
+- 审批恢复时先按 `workflow_id` 幂等创建外联任务，再恢复图并保存生成历史。`emails` 和 `outreach_jobs` 都使用“非空 workflow_id 唯一”索引，重复恢复不会重复落库；相同 ID 但内容不一致会拒绝。
+- 服务重启后，内存任务缺失时 `/api/email/tasks/{id}` 从 SQLite checkpoint 投影原有前端任务结构；已完成审批再次恢复时直接返回现有状态，不重复执行副作用。
+- checkpoint 中可能含生成草稿和客户上下文，因此不得进入诊断 ZIP、Git 或公开构建素材。诊断测试使用合成标记验证既不导出 checkpoint 内容，也不暴露数据库文件名。
