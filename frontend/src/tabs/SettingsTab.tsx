@@ -67,6 +67,11 @@ const EMAIL_TRANSPORT_OPTIONS = [
   { value: "starttls", label: "STARTTLS · 587" },
 ] as const;
 
+type EmailTestResult = {
+  status: "testing" | "ok" | "error";
+  message: string;
+};
+
 export default function SettingsTab() {
   const [config, setConfig] = useState<ConfigState>({ has_key: false });
   const [editing, setEditing] = useState<string | null>(null); // 正在配置的 provider id
@@ -87,6 +92,7 @@ export default function SettingsTab() {
   const [emailSettings, setEmailSettings] = useState<EmailOutreachSettings>(EMPTY_EMAIL_SETTINGS);
   const [emailCredential, setEmailCredential] = useState("");
   const [emailBusy, setEmailBusy] = useState(false);
+  const [emailTestResult, setEmailTestResult] = useState<EmailTestResult | null>(null);
   const [deleteEmailCredentialOpen, setDeleteEmailCredentialOpen] = useState(false);
   const toast = useToast();
 
@@ -252,6 +258,7 @@ export default function SettingsTab() {
   }, [toast.push]);
 
   const saveEmailSettings = useCallback(async () => {
+    setEmailTestResult(null);
     setEmailBusy(true);
     try {
       const result = await api.outreach.saveEmailSettings({
@@ -275,18 +282,26 @@ export default function SettingsTab() {
   }, [emailCredential, emailSettings, toast.push]);
 
   const testEmailSettings = useCallback(async () => {
+    setEmailTestResult({ status: "testing", message: "正在连接邮箱服务器并验证授权凭据…" });
     setEmailBusy(true);
     try {
       const result = await api.outreach.testEmailSettings();
-      toast.push(result.ok ? (result.summary || "连接成功") : (result.error || result.summary || "连接失败"), result.ok ? "ok" : "error");
+      const message = result.ok
+        ? (result.summary || "连接成功")
+        : (result.error || result.summary || "连接失败");
+      setEmailTestResult({ status: result.ok ? "ok" : "error", message });
+      toast.push(message, result.ok ? "ok" : "error");
     } catch (error) {
-      toast.push(error instanceof Error ? error.message : "连接测试失败", "error");
+      const message = error instanceof Error ? error.message : "连接测试失败";
+      setEmailTestResult({ status: "error", message });
+      toast.push(message, "error");
     } finally {
       setEmailBusy(false);
     }
   }, [toast.push]);
 
   const deleteEmailCredential = useCallback(async () => {
+    setEmailTestResult(null);
     setEmailBusy(true);
     try {
       const result = await api.outreach.deleteEmailCredential();
@@ -498,6 +513,7 @@ export default function SettingsTab() {
               options={EMAIL_PROVIDER_OPTIONS}
               onChange={(value) => {
                 const provider = value as EmailOutreachSettings["provider"];
+                setEmailTestResult(null);
                 setEmailSettings({
                   ...emailSettings,
                   provider,
@@ -516,7 +532,10 @@ export default function SettingsTab() {
               type="email"
               value={emailSettings.address}
               placeholder={emailSettings.provider === "qq_smtp" ? "example@qq.com" : "example@gmail.com"}
-              onChange={(event) => setEmailSettings({ ...emailSettings, address: event.target.value })}
+              onChange={(event) => {
+                setEmailTestResult(null);
+                setEmailSettings({ ...emailSettings, address: event.target.value });
+              }}
             />
           </div>
           <div className="field">
@@ -526,7 +545,10 @@ export default function SettingsTab() {
               ariaLabel="加密方式"
               value={emailSettings.transport}
               options={EMAIL_TRANSPORT_OPTIONS}
-              onChange={(value) => setEmailSettings({ ...emailSettings, transport: value as EmailOutreachSettings["transport"] })}
+              onChange={(value) => {
+                setEmailTestResult(null);
+                setEmailSettings({ ...emailSettings, transport: value as EmailOutreachSettings["transport"] });
+              }}
             />
           </div>
           <div className="field email-settings-secret">
@@ -540,7 +562,10 @@ export default function SettingsTab() {
               autoComplete="new-password"
               value={emailCredential}
               placeholder={emailSettings.has_credential ? "已配置，留空保持不变" : "仅写入 Windows 凭据管理器"}
-              onChange={(event) => setEmailCredential(event.target.value)}
+              onChange={(event) => {
+                setEmailTestResult(null);
+                setEmailCredential(event.target.value);
+              }}
             />
           </div>
         </div>
@@ -548,12 +573,24 @@ export default function SettingsTab() {
           <span>{emailSettings.host} · {emailSettings.transport === "ssl" ? 465 : 587}</span>
           <span>连接测试只验证加密连接与登录，不发送测试邮件。</span>
         </div>
+        {emailTestResult && (
+          <div
+            className={`outreach-notice ${emailTestResult.status === "ok" ? "status-accepted" : emailTestResult.status === "error" ? "status-failed" : "status-unknown"}`}
+            role="status"
+            aria-live="polite"
+          >
+            {emailTestResult.status === "testing" ? "连接测试：" : emailTestResult.status === "ok" ? "连接成功：" : "连接失败："}
+            {emailTestResult.message}
+          </div>
+        )}
         {emailSettings.credential_error && <div className="outreach-notice status-failed">{emailSettings.credential_error}</div>}
         <div className="email-settings-actions">
           <button className="btn btn-primary" onClick={saveEmailSettings} disabled={emailBusy || !emailSettings.address.trim()}>
             {emailBusy ? "处理中…" : "保存邮箱设置"}
           </button>
-          <button className="btn btn-ghost" onClick={testEmailSettings} disabled={emailBusy || !emailSettings.has_credential}>测试连接</button>
+          <button className="btn btn-ghost" onClick={testEmailSettings} disabled={emailBusy || !emailSettings.has_credential}>
+            {emailTestResult?.status === "testing" ? "测试中…" : "测试连接"}
+          </button>
           <button className="btn btn-danger" onClick={() => setDeleteEmailCredentialOpen(true)} disabled={emailBusy || !emailSettings.has_credential}>移除凭据</button>
         </div>
       </div>

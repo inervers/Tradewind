@@ -322,6 +322,20 @@ class ServerOutreachTests(unittest.TestCase):
             OutreachStore(self.db).get_job(created["id"])["status"], "pending_review"
         )
 
+    def test_public_transition_restores_skipped_job_to_review(self) -> None:
+        created = self.create_email()
+        skipped = server.api_outreach_transition(
+            created["id"], server.OutreachTransitionRequest(status="skipped")
+        )
+        self.assertTrue(skipped["ok"])
+
+        restored = server.api_outreach_transition(
+            created["id"], server.OutreachTransitionRequest(status="pending_review")
+        )
+
+        self.assertTrue(restored["ok"])
+        self.assertEqual(restored["item"]["status"], "pending_review")
+
     def test_rebind_sender_uses_current_account_and_returns_to_review(self) -> None:
         created = self.create_email()
         current = {

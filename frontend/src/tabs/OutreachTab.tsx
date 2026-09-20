@@ -384,6 +384,9 @@ export default function OutreachTab() {
                 {(selected.status === "accepted" || selected.status === "sent_manual") && (
                   <button className="btn btn-primary" onClick={() => transition("replied")} disabled={busy}>标记已回复</button>
                 )}
+                {selected.status === "skipped" && (
+                  <button className="btn btn-primary" onClick={() => transition("pending_review")} disabled={busy}>恢复待审核</button>
+                )}
                 {NEEDS_ACTION.includes(selected.status) && selected.status !== "unknown" && (
                   <button className="btn btn-ghost" onClick={() => transition("skipped")} disabled={busy}>跳过</button>
                 )}

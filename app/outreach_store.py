@@ -42,7 +42,7 @@ ALLOWED_TRANSITIONS = {
     "sent_manual": {"replied", "suppressed"},
     "replied": {"suppressed"},
     "invalid": set(),
-    "skipped": set(),
+    "skipped": {"pending_review"},
     "suppressed": set(),
 }
 

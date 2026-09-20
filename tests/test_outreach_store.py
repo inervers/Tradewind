@@ -116,6 +116,17 @@ class OutreachStoreTests(unittest.TestCase):
         whatsapp_items = self.store.list_jobs(channel="whatsapp")
         self.assertEqual([item["status"] for item in whatsapp_items], ["skipped"])
 
+    def test_skipped_job_can_return_to_pending_review(self) -> None:
+        job = self.create_email()
+        skipped = self.store.transition(job["id"], "skipped")
+        self.assertEqual(skipped["status"], "skipped")
+
+        restored = self.store.transition(job["id"], "pending_review")
+
+        self.assertEqual(restored["status"], "pending_review")
+        self.assertEqual(restored["subject"], job["subject"])
+        self.assertEqual(restored["body"], job["body"])
+
     def test_suppression_transitions_matching_active_jobs_and_can_be_removed(self) -> None:
         job = self.create_whatsapp()
         suppression = self.store.add_suppression(
