@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import smtplib
 import socket
 import ssl
@@ -10,6 +11,39 @@ from email.message import EmailMessage
 from typing import Literal
 
 from app.config import EMAIL_PROVIDER_PRESETS
+
+
+_EMAIL_ADDRESS_RE = re.compile(
+    r"(?i)\b[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}\b"
+)
+_SMTP_DETAIL_LIMIT = 160
+
+
+def _safe_smtp_detail(raw_detail: bytes | str) -> str:
+    if isinstance(raw_detail, bytes):
+        for encoding in ("utf-8", "gb18030"):
+            try:
+                detail = raw_detail.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            detail = raw_detail.decode("utf-8", errors="replace")
+    else:
+        detail = str(raw_detail)
+
+    detail = re.sub(r"[\x00-\x1f\x7f]+", " ", detail)
+    detail = re.sub(r"\s+", " ", detail).strip()
+    detail = _EMAIL_ADDRESS_RE.sub("[邮箱已隐藏]", detail)
+    if len(detail) > _SMTP_DETAIL_LIMIT:
+        detail = detail[: _SMTP_DETAIL_LIMIT - 1].rstrip() + "…"
+    return detail
+
+
+def _data_rejection_summary(exc: smtplib.SMTPDataError) -> str:
+    summary = f"邮件内容被邮箱服务器明确拒绝（SMTP {int(exc.smtp_code)}）"
+    detail = _safe_smtp_detail(exc.smtp_error)
+    return f"{summary}：{detail}" if detail else summary
 
 
 @dataclass(frozen=True)
@@ -80,7 +114,7 @@ class SmtpSender:
         except smtplib.SMTPDataError as exc:
             if 500 <= int(exc.smtp_code) < 600:
                 return SendOutcome(
-                    "failed", "message_rejected", "邮件内容被邮箱服务器明确拒绝"
+                    "failed", "message_rejected", _data_rejection_summary(exc)
                 )
             return SendOutcome(
                 "unknown", "submission_uncertain", "提交结果不确定，请检查发件箱"

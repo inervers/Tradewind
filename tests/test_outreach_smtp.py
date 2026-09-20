@@ -122,8 +122,10 @@ class SmtpSenderTests(unittest.TestCase):
             (result.status, result.code), ("failed", "recipient_rejected")
         )
 
-    def test_definite_data_rejection_is_failed(self) -> None:
-        error = smtplib.SMTPDataError(550, b"private rejection")
+    def test_definite_data_rejection_includes_code_and_chinese_reason(self) -> None:
+        error = smtplib.SMTPDataError(
+            554, "邮件内容涉嫌垃圾邮件".encode("utf-8")
+        )
         result = SmtpSender(
             factory=lambda *_args, **_kwargs: FakeSMTP(send_error=error)
         ).send(
@@ -136,7 +138,46 @@ class SmtpSenderTests(unittest.TestCase):
             "secret",
         )
         self.assertEqual((result.status, result.code), ("failed", "message_rejected"))
-        self.assertNotIn("private rejection", result.summary)
+        self.assertEqual(
+            result.summary,
+            "邮件内容被邮箱服务器明确拒绝（SMTP 554）：邮件内容涉嫌垃圾邮件",
+        )
+
+    def test_data_rejection_redacts_addresses_and_control_characters(self) -> None:
+        error = smtplib.SMTPDataError(
+            550, b"recipient buyer@example.test blocked\r\ncontact sender@qq.com"
+        )
+        result = SmtpSender(
+            factory=lambda *_args, **_kwargs: FakeSMTP(send_error=error)
+        ).send(
+            self.job(),
+            {"provider": "qq_smtp", "address": "a@qq.com", "transport": "ssl"},
+            "secret",
+        )
+        self.assertEqual(
+            result.summary,
+            "邮件内容被邮箱服务器明确拒绝（SMTP 550）：recipient [邮箱已隐藏] blocked contact [邮箱已隐藏]",
+        )
+        self.assertNotIn("buyer@example.test", result.summary)
+        self.assertNotIn("\r", result.summary)
+        self.assertNotIn("\n", result.summary)
+
+    def test_data_rejection_truncates_long_server_reason(self) -> None:
+        error = smtplib.SMTPDataError(554, ("policy detail " * 40).encode("ascii"))
+        result = SmtpSender(
+            factory=lambda *_args, **_kwargs: FakeSMTP(send_error=error)
+        ).send(
+            self.job(),
+            {
+                "provider": "gmail_smtp",
+                "address": "sender@example.test",
+                "transport": "ssl",
+            },
+            "secret",
+        )
+        detail = result.summary.split("：", 1)[1]
+        self.assertLessEqual(len(detail), 160)
+        self.assertTrue(detail.endswith("…"))
 
     def test_connection_failure_before_submission_is_failed_network(self) -> None:
         def broken_factory(*_args, **_kwargs):
