@@ -14,6 +14,7 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -22,6 +23,8 @@ import uuid
 import warnings
 import zipfile
 from collections import Counter
+from datetime import date
+from functools import wraps
 from pathlib import Path
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
@@ -30,11 +33,11 @@ from xml.etree import ElementTree
 warnings.filterwarnings("ignore", message="Couldn't find ffmpeg or avconv.*")
 
 import httpx
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel, Field
 
 from app.config import (
     EMAIL_PROVIDER_PRESETS, PROVIDER_PRESETS, ROOT_DIR, VISION_PROVIDERS,
@@ -45,6 +48,7 @@ from app.config import (
     set_vision_config, settings, vision_key_format_error,
 )
 from app.credential_store import CredentialStore, CredentialUnavailable
+from app.customer_followup import FollowupConflict, FollowupNotFound, FollowupStore, paginate_timeline
 from app.email_agent import GenerationCancelled, generate_email
 from app.email_workflow import WorkflowContext, build_sqlite_workflow
 from app.crawler.progress import use_progress_sink
@@ -102,6 +106,7 @@ MEMORY_DB_FILE = DATA_DIR / "tradewind_memory.db"
 CRAWLER_SEEN_FILE = DATA_DIR / "crawler_seen.json"
 CRAWLER_PHOTOS_DIR = DATA_DIR / "crawler_photos"
 PHOTO_SCAN_DIR = DATA_DIR / "photo_scan"
+_CUSTOMERS_LOCK = threading.RLock()
 
 
 def _ensure_data_files() -> None:
@@ -175,6 +180,50 @@ def _read_json(path: Path, default: list) -> list:
         return data if isinstance(data, list) else default
     except Exception:  # noqa: BLE001
         return default
+
+
+def _read_customers() -> list[dict]:
+    """Do not turn corrupt user data into an empty list and overwrite it."""
+    try:
+        items = json.loads(CUSTOMERS_FILE.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise HTTPException(500, "客户名单读取失败，请先备份并检查数据文件") from None
+    if not isinstance(items, list):
+        raise HTTPException(500, "客户名单格式无效，未修改原文件")
+    ids = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip():
+            raise HTTPException(500, "客户编号无效，未修改原文件")
+        ids.append(item["id"])
+    if len(set(ids)) != len(ids):
+        raise HTTPException(500, "客户编号重复，请先检查名单；未修改原文件")
+    return items
+
+
+def _customer_locked(func):
+    @wraps(func)
+    def locked(*args, **kwargs):
+        with _CUSTOMERS_LOCK:
+            return func(*args, **kwargs)
+    return locked
+
+
+def _followup_errors(func):
+    @wraps(func)
+    def guarded(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except FollowupConflict as exc:
+            raise HTTPException(409, str(exc)) from None
+        except FollowupNotFound as exc:
+            raise HTTPException(404, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except (sqlite3.Error, OSError):
+            raise HTTPException(503, "跟进资料暂时无法读写，请稍后重试") from None
+    return guarded
 
 
 def _write_json(path: Path, data: list) -> None:
@@ -295,6 +344,21 @@ class CustomerRequest(BaseModel):
     phone: str = ""
     notes: str = ""
     status: str = "new"
+
+
+class FollowupRecordRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    contacted_at: AwareDatetime
+    channel: str
+    outcome: str
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class FollowupPlanRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    due_date: str = Field(min_length=10, max_length=10)
+    action: str = Field(min_length=1, max_length=500)
+    expected_plan_id: int | None = Field(default=None, ge=1, strict=True)
 
 
 class OutreachCreateRequest(BaseModel):
@@ -1713,15 +1777,17 @@ def _customer_seen_keys(items: list[dict]) -> set[str]:
     return {key for item in items for key in _customer_identity_keys(item)}
 
 @app.get("/api/customers")
+@_customer_locked
 def api_customers() -> list[dict]:
-    return _read_json(CUSTOMERS_FILE, [])
+    return _read_customers()
 
 
 @app.post("/api/customers")
+@_customer_locked
 def api_customer_add(req: CustomerRequest) -> dict:
-    items = _read_json(CUSTOMERS_FILE, [])
+    items = _read_customers()
     item = {
-        "id": _next_id(items, "c-"),
+        "id": f"c-{uuid.uuid4().hex}",
         "name": req.name.strip(),
         "country": req.country.strip(),
         "city": req.city.strip(),
@@ -1741,8 +1807,9 @@ def api_customer_add(req: CustomerRequest) -> dict:
 
 
 @app.put("/api/customers/{item_id}")
+@_customer_locked
 def api_customer_update(item_id: str, req: CustomerRequest) -> dict:
-    items = _read_json(CUSTOMERS_FILE, [])
+    items = _read_customers()
     for it in items:
         if it.get("id") == item_id:
             it.update({
@@ -1758,27 +1825,37 @@ def api_customer_update(item_id: str, req: CustomerRequest) -> dict:
 
 
 @app.delete("/api/customers/{item_id}")
+@_customer_locked
 def api_customer_delete(item_id: str) -> dict:
-    items = _read_json(CUSTOMERS_FILE, [])
-    items = [it for it in items if it.get("id") != item_id]
-    _write_json(CUSTOMERS_FILE, items)
+    items = _read_customers()
+    kept = [it for it in items if it.get("id") != item_id]
+    if len(kept) != len(items):
+        _write_json(CUSTOMERS_FILE, kept)
+    cleanup_error = _cleanup_deleted_followups([item_id])
+    if cleanup_error:
+        return {"ok": False, "customer_deleted": True, "error": cleanup_error}
     return {"ok": True}
 
 
 @app.post("/api/customers/batch-delete")
+@_customer_locked
 def api_customer_batch_delete(body: dict) -> dict:
     ids = {str(item_id) for item_id in (body.get("ids") or []) if item_id}
     if not ids:
         return {"ok": False, "error": "未选择客户"}
-    items = _read_json(CUSTOMERS_FILE, [])
+    items = _read_customers()
     kept = [item for item in items if str(item.get("id")) not in ids]
     removed = len(items) - len(kept)
     if removed:
         _write_json(CUSTOMERS_FILE, kept)
+    cleanup_error = _cleanup_deleted_followups(list(ids))
+    if cleanup_error:
+        return {"ok": False, "customer_deleted": True, "removed": removed, "total": len(kept), "error": cleanup_error}
     return {"ok": True, "removed": removed, "total": len(kept)}
 
 
 @app.post("/api/customers/import")
+@_customer_locked
 def api_customer_import(body: dict) -> dict:
     """导入 CSV 文本（utf-8-sig 兼容 Excel），字段 name,country,city,email,website,notes。
     source 标记来源：manual（手动/CSV）| maps | webs，客户名单按此分组。"""
@@ -1793,13 +1870,12 @@ def api_customer_import(body: dict) -> dict:
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"CSV 解析失败: {exc}"}
 
-    items = _read_json(CUSTOMERS_FILE, [])
+    items = _read_customers()
     seen = _customer_seen_keys(items)
     added = 0
     duplicates = 0
     invalid = 0
     added_items: list[dict] = []
-    next_number = int(_next_id(items, "c-").removeprefix("c-"))
     for row in rows:
         name = (row.get("name") or "").strip()
         if not name:
@@ -1810,7 +1886,7 @@ def api_customer_import(body: dict) -> dict:
         if "WhatsApp" in email_raw or "跟进" in email_raw:
             email_raw = ""
         item = {
-            "id": f"c-{next_number:03d}",
+            "id": f"c-{uuid.uuid4().hex}",
             "name": name,
             "country": (row.get("country") or "").strip(),
             "city": (row.get("city") or "").strip(),
@@ -1831,7 +1907,6 @@ def api_customer_import(body: dict) -> dict:
         items.append(item)
         added_items.append(item)
         added += 1
-        next_number += 1
     # 全部重复时不再重写整份名单；这是重复点击导入时最常见的慢路径。
     if added:
         _write_json(CUSTOMERS_FILE, items)
@@ -2180,11 +2255,12 @@ def _outreach_store() -> OutreachStore:
     return OutreachStore(MEMORY_DB_FILE)
 
 
+@_customer_locked
 def _find_customer_by_id(customer_id: str) -> dict | None:
     return next(
         (
             item
-            for item in _read_json(CUSTOMERS_FILE, [])
+            for item in _read_customers()
             if str(item.get("id", "")) == customer_id
         ),
         None,
@@ -2215,10 +2291,11 @@ def _recipient_is_suppressed(channel: str, recipient: str) -> bool:
     )
 
 
+@_customer_locked
 def sync_customer_outreach_status(customer_id: str, status: str) -> None:
     if status not in {"sent", "replied"}:
         return
-    items = _read_json(CUSTOMERS_FILE, [])
+    items = _read_customers()
     changed = False
     for item in items:
         if str(item.get("id", "")) == customer_id and item.get("status") != status:
@@ -2613,6 +2690,154 @@ def recover_outreach_after_startup() -> int:
 
 
 app.router.add_event_handler("startup", recover_outreach_after_startup)
+
+
+# ---------- 客户名单内跟进（本地记录，不执行外联） ----------
+
+def _followup_store() -> FollowupStore:
+    return FollowupStore(MEMORY_DB_FILE)
+
+
+def _require_followup_customer(customer_id: str) -> dict:
+    customer = _find_customer_by_id(customer_id)
+    if customer is None:
+        raise HTTPException(404, "客户不存在")
+    return customer
+
+
+def _cleanup_deleted_followups(customer_ids: list[str]) -> str:
+    if not MEMORY_DB_FILE.exists():
+        return ""
+    try:
+        _followup_store().delete_customers(customer_ids)
+    except (sqlite3.Error, OSError):
+        return "客户已删除，跟进记录清理失败；可重试删除或重启后重新清理"
+    return ""
+
+
+@_customer_locked
+def cleanup_orphan_followups() -> dict:
+    if not CUSTOMERS_FILE.is_file():
+        return {"ok": False, "skipped": True, "error": "未找到可验证的客户名单，未清理跟进资料"}
+    try:
+        customers = _read_customers()
+        if MEMORY_DB_FILE.exists():
+            _followup_store().prune_orphans([c["id"] for c in customers])
+        return {"ok": True}
+    except (HTTPException, sqlite3.Error, OSError):
+        return {"ok": False, "error": "客户名单或跟进资料无法验证，已跳过清理；请检查数据文件"}
+
+
+def _startup_followup_cleanup() -> None:
+    report = cleanup_orphan_followups()
+    if not report["ok"] and not report.get("skipped"):
+        print("[Tradewind] 客户名单或跟进资料无法验证，已跳过跟进清理。")
+
+
+app.router.add_event_handler("startup", _startup_followup_cleanup)
+
+
+@app.get("/api/customers/followup-summary")
+@_customer_locked
+@_followup_errors
+def api_followup_summary() -> dict:
+    customers = _read_customers()
+    ids = [c["id"] for c in customers]
+    today = date.today().isoformat()
+    summaries = _followup_store().summaries(ids, today)
+    if ids and MEMORY_DB_FILE.exists():
+        for customer_id, latest in _outreach_store().customer_contact_times(ids).items():
+            summaries[customer_id]["last_contact_at"] = max(summaries[customer_id]["last_contact_at"] or 0, latest)
+    return {"today": today, "items": list(summaries.values())}
+
+
+@app.get("/api/customers/{customer_id}/followup")
+@_customer_locked
+@_followup_errors
+def api_followup_detail(customer_id: str) -> dict:
+    _require_followup_customer(customer_id)
+    return {"plan": _followup_store().active_plan(customer_id)}
+
+
+def _known_outreach_timeline(customer_id: str) -> list[dict]:
+    items = []
+    for job in _outreach_store().customer_history(customer_id):
+        common = {"job_id": job["id"], "channel": job["channel"], "status": job["status"], "content": ""}
+        def event(kind: str, at: float, suffix: str) -> None:
+            items.append({**common, "id": f"outreach:{job['id']}:{suffix}", "kind": kind, "occurred_at": at})
+        event("outreach_created", job["created_at"], "created")
+        if job["opened_at"]:
+            event("outreach_opened", job["opened_at"], "opened")
+        if job["submitted_at"]:
+            status = job["status"]
+            if job["channel"] == "email" and status in {"accepted", "replied"}:
+                kind = "outreach_accepted"
+            elif job["channel"] == "whatsapp" and status in {"sent_manual", "replied"}:
+                kind = "outreach_sent_manual"
+            elif status in {"failed", "unknown"}:
+                kind = f"outreach_{status}"
+            else:
+                kind = "outreach_submission_recorded"
+            event(kind, job["submitted_at"], "submitted")
+        if job["replied_at"]:
+            event("outreach_replied", job["replied_at"], "replied")
+    return items
+
+
+@app.get("/api/customers/{customer_id}/followup/timeline")
+@_customer_locked
+@_followup_errors
+def customer_followup_timeline(customer_id: str, limit: int = Query(50, ge=1, le=100),
+                               offset: int = Query(0, ge=0)) -> dict:
+    _require_followup_customer(customer_id)
+    items = _followup_store().timeline_items(customer_id) + _known_outreach_timeline(customer_id)
+    return paginate_timeline(items, limit=limit, offset=offset)
+
+
+@app.post("/api/customers/{customer_id}/followup/records")
+@_customer_locked
+@_followup_errors
+def api_followup_add_record(customer_id: str, req: FollowupRecordRequest) -> dict:
+    customer = _require_followup_customer(customer_id)
+    item = _followup_store().add_record(customer_id, customer.get("name", ""),
+        contacted_at=req.contacted_at.timestamp(), channel=req.channel, outcome=req.outcome,
+        content=req.content, request_id=req.request_id)
+    return {"ok": True, "item": item}
+
+
+@app.delete("/api/customers/{customer_id}/followup/records/{record_id}")
+@_customer_locked
+@_followup_errors
+def api_followup_delete_record(customer_id: str, record_id: int) -> dict:
+    _require_followup_customer(customer_id)
+    _followup_store().delete_record(customer_id, record_id)
+    return {"ok": True}
+
+
+@app.post("/api/customers/{customer_id}/followup/plans")
+@_customer_locked
+@_followup_errors
+def api_followup_set_plan(customer_id: str, req: FollowupPlanRequest) -> dict:
+    customer = _require_followup_customer(customer_id)
+    item = _followup_store().set_plan(customer_id, customer.get("name", ""), due_date=req.due_date,
+        action=req.action, request_id=req.request_id, expected_plan_id=req.expected_plan_id)
+    return {"ok": True, "item": item}
+
+
+@app.post("/api/customers/{customer_id}/followup/plans/{plan_id}/complete")
+@_customer_locked
+@_followup_errors
+def api_followup_complete_plan(customer_id: str, plan_id: int) -> dict:
+    _require_followup_customer(customer_id)
+    return {"ok": True, "item": _followup_store().close_plan(customer_id, plan_id, "completed")}
+
+
+@app.post("/api/customers/{customer_id}/followup/plans/{plan_id}/cancel")
+@_customer_locked
+@_followup_errors
+def api_followup_cancel_plan(customer_id: str, plan_id: int) -> dict:
+    _require_followup_customer(customer_id)
+    return {"ok": True, "item": _followup_store().close_plan(customer_id, plan_id, "cancelled")}
 
 
 # ---------- 静态托管（API 路由定义之后再 mount，避免覆盖） ----------

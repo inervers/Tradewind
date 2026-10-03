@@ -32,6 +32,29 @@ export interface Customer {
   created_at?: number;
 }
 
+export type FollowupChannel = "email" | "whatsapp" | "phone" | "other";
+export type FollowupOutcome = "awaiting_reply" | "replied" | "in_progress" | "not_interested" | "invalid" | "note";
+export type FollowupDueStatus = "overdue" | "today" | "upcoming" | "unplanned";
+export interface FollowupRecord {
+  id: number; customer_id: string; contacted_at: number;
+  channel: FollowupChannel; outcome: FollowupOutcome; content: string; request_id: string;
+}
+export interface FollowupPlan {
+  id: number; customer_id: string; due_date: string; action: string;
+  status: "active" | "completed" | "cancelled" | "superseded";
+}
+export interface FollowupSummary {
+  customer_id: string; plan: FollowupPlan | null; due_status: FollowupDueStatus; last_contact_at: number | null;
+}
+export interface FollowupTimelineItem {
+  id: string; kind: string; occurred_at: number; content: string;
+  channel: FollowupChannel; outcome?: FollowupOutcome; record_id?: number;
+  plan_id?: number; due_date?: string; previous_due_date?: string; job_id?: number; status?: string;
+}
+export interface FollowupTimelinePage {
+  items: FollowupTimelineItem[]; has_more: boolean; next_offset: number;
+}
+
 export type Lang = "zh-hant" | "en";
 export type OutFormat = "email" | "whatsapp";
 

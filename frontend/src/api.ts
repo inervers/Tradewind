@@ -4,6 +4,7 @@ import type {
   ExtractTask, HistoryItem, Lang, OutFormat, OutreachChannel, OutreachJob,
   OutreachStatus, OutreachSuppression, PhotoLibraryStore, PhotoTaskState, Product,
   TaskState, Template,
+  FollowupChannel, FollowupOutcome, FollowupRecord, FollowupPlan, FollowupSummary, FollowupTimelinePage,
 } from "./types";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
@@ -111,10 +112,23 @@ export const api = {
     add: (c: Partial<Customer>) => post<{ ok: boolean; item?: Customer; duplicate?: boolean; error?: string }>("/api/customers", c),
     update: (id: string, c: Partial<Customer>) =>
       req<{ ok: boolean; item?: Customer }>(`/api/customers/${id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(c) }),
-    remove: (id: string) => req<{ ok: boolean }>(`/api/customers/${id}`, { method: "DELETE" }),
-    removeBatch: (ids: string[]) => post<{ ok: boolean; removed?: number; total?: number; error?: string }>("/api/customers/batch-delete", { ids }),
+    remove: (id: string) => req<{ ok: boolean; customer_deleted?: boolean; error?: string }>(`/api/customers/${id}`, { method: "DELETE" }),
+    removeBatch: (ids: string[]) => post<{ ok: boolean; customer_deleted?: boolean; removed?: number; total?: number; error?: string }>("/api/customers/batch-delete", { ids }),
     importCsv: (text: string, source?: "manual" | "maps" | "webs") =>
       post<{ ok: boolean; added?: number; duplicates?: number; invalid?: number; total?: number; items?: Customer[]; error?: string }>("/api/customers/import", { text, source: source || "manual" }),
+  },
+
+  followups: {
+    summary: () => req<{ today: string; items: FollowupSummary[] }>("/api/customers/followup-summary", { cache: "no-store" }),
+    get: (id: string) => req<{ plan: FollowupPlan | null }>(`/api/customers/${encodeURIComponent(id)}/followup`, { cache: "no-store" }),
+    timeline: (id: string, offset = 0) => req<FollowupTimelinePage>(`/api/customers/${encodeURIComponent(id)}/followup/timeline?limit=30&offset=${offset}`, { cache: "no-store" }),
+    addRecord: (id: string, payload: { request_id: string; contacted_at: string; channel: FollowupChannel; outcome: FollowupOutcome; content: string }) =>
+      post<{ ok: true; item: FollowupRecord }>(`/api/customers/${encodeURIComponent(id)}/followup/records`, payload),
+    deleteRecord: (id: string, recordId: number) => req<{ ok: true }>(`/api/customers/${encodeURIComponent(id)}/followup/records/${recordId}`, { method: "DELETE" }),
+    setPlan: (id: string, payload: { request_id: string; due_date: string; action: string; expected_plan_id: number | null }) =>
+      post<{ ok: true; item: FollowupPlan }>(`/api/customers/${encodeURIComponent(id)}/followup/plans`, payload),
+    completePlan: (id: string, planId: number) => post<{ ok: true; item: FollowupPlan }>(`/api/customers/${encodeURIComponent(id)}/followup/plans/${planId}/complete`, {}),
+    cancelPlan: (id: string, planId: number) => post<{ ok: true; item: FollowupPlan }>(`/api/customers/${encodeURIComponent(id)}/followup/plans/${planId}/cancel`, {}),
   },
 
   history: {

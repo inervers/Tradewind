@@ -109,6 +109,9 @@ class OutreachStore:
             ON outreach_jobs(customer_id, channel)
             WHERE status IN ('pending_review', 'opened', 'sending', 'unknown', 'failed');
 
+            CREATE INDEX IF NOT EXISTS idx_outreach_customer_history
+            ON outreach_jobs(customer_id, created_at DESC, id DESC);
+
             CREATE TABLE IF NOT EXISTS contact_suppressions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel TEXT NOT NULL,
@@ -260,9 +263,13 @@ class OutreachStore:
         channel: str | None = None,
         statuses: set[str] | None = None,
         limit: int = 200,
+        customer_id: str | None = None,
     ) -> list[dict]:
         clauses: list[str] = []
         params: list[object] = []
+        if customer_id is not None:
+            clauses.append("customer_id=?")
+            params.append(customer_id)
         if channel:
             if channel not in {"email", "whatsapp"}:
                 raise ValueError("不支持的外联渠道")
@@ -286,6 +293,39 @@ class OutreachStore:
         finally:
             conn.close()
         return [self._job(row) for row in rows]
+
+    def customer_history(self, customer_id: str) -> list[dict]:
+        """Only known metadata, filtered before any timeline pagination."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("""
+                SELECT id,channel,status,created_at,updated_at,opened_at,submitted_at,replied_at
+                FROM outreach_jobs WHERE customer_id=? ORDER BY created_at DESC,id DESC
+            """, (customer_id,)).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def customer_contact_times(self, customer_ids: list[str]) -> dict[str, float]:
+        result = {}
+        conn = self._connect()
+        try:
+            for start in range(0, len(customer_ids), 500):
+                batch = customer_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(f"""
+                    SELECT customer_id,submitted_at,replied_at,status,channel FROM outreach_jobs
+                    WHERE customer_id IN ({placeholders})
+                """, batch)
+                for row in rows:
+                    confirmed = row["status"] in {"accepted", "sent_manual", "replied"}
+                    times = [row["replied_at"] or 0, (row["submitted_at"] or 0) if confirmed else 0]
+                    latest = max(times)
+                    if latest:
+                        result[row["customer_id"]] = max(result.get(row["customer_id"], 0), latest)
+            return result
+        finally:
+            conn.close()
 
     def update_content(self, job_id: int, subject: str, body: str) -> dict:
         current = self.get_job(job_id)

@@ -4,6 +4,7 @@ import {
   BatchIcon, BoxIcon, ClockIcon, GearIcon, InboxIcon, MailIcon, PhotoIcon, RadarIcon, RouteIcon, SailboatIcon, UsersIcon,
 } from "./components/Icons";
 import { api } from "./api";
+import ConfirmDialog from "./components/ConfirmDialog";
 import ComposeTab from "./tabs/ComposeTab";
 import BatchTab from "./tabs/BatchTab";
 import CustomersTab from "./tabs/CustomersTab";
@@ -130,12 +131,21 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [composeSeed, setComposeSeed] = useState<ComposeSeed | null>(null);
+  const [followupDirty, setFollowupDirty] = useState(false);
+  const [followupBusy, setFollowupBusy] = useState(false);
+  const [pendingNavigation, setPendingNavigation] = useState<{ tab: TabKey; seed?: ComposeSeed } | null>(null);
   const toast = useToast();
 
+  const navigate = useCallback((destination: TabKey, seed?: ComposeSeed) => {
+    if (destination === tab && !seed) return;
+    if (followupBusy) { toast.push("跟进正在保存，请稍候再切换页面", "info"); return; }
+    if (followupDirty) { setPendingNavigation({ tab: destination, seed }); return; }
+    if (seed) setComposeSeed(seed);
+    setTab(destination);
+  }, [tab, followupDirty, followupBusy, toast.push]);
   const startOutreach = useCallback((seed: ComposeSeed) => {
-    setComposeSeed(seed);
-    setTab("compose");
-  }, []);
+    navigate("compose", seed);
+  }, [navigate]);
 
   useEffect(() => {
     let cancelled = false;
@@ -229,8 +239,9 @@ export default function App() {
           {TABS.map((t) => (
             <button
               key={t.key}
+              aria-label={t.label}
               className={`nav-item ${tab === t.key ? "active" : ""}`}
-              onClick={() => setTab(t.key)}
+              onClick={() => navigate(t.key)}
             >
               <t.icon size={17} />
               <span>{t.label}</span>
@@ -249,11 +260,11 @@ export default function App() {
             <ComposeTab
               seed={composeSeed}
               onSeedConsumed={() => setComposeSeed(null)}
-              onOpenOutreach={() => setTab("outreach")}
+              onOpenOutreach={() => navigate("outreach")}
             />
           )}
           {tab === "batch" && <BatchTab />}
-          {tab === "customers" && <CustomersTab onStartOutreach={startOutreach} />}
+          {tab === "customers" && <CustomersTab onStartOutreach={startOutreach} onFollowupDirtyChange={setFollowupDirty} onFollowupBusyChange={setFollowupBusy} />}
           {tab === "outreach" && <OutreachTab />}
           {tab === "crawler" && <CrawlerTab />}
           {tab === "photos" && <PhotosTab />}
@@ -265,6 +276,10 @@ export default function App() {
       </main>
       <Stamp />
       {toast.el}
+      {pendingNavigation && <ConfirmDialog title="离开客户名单并放弃未保存的跟进内容？" desc="已保存的沟通记录和跟进安排会保留。" confirmText="放弃并切换" onCancel={() => setPendingNavigation(null)} onConfirm={() => {
+        if (pendingNavigation.seed) setComposeSeed(pendingNavigation.seed);
+        setFollowupDirty(false); setTab(pendingNavigation.tab); setPendingNavigation(null);
+      }} />}
     </div>
   );
 }

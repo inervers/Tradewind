@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import server
 from app.outreach_store import OutreachStore
+from app.customer_followup import FollowupStore
+import time
 
 
 class DiagnosticExportTests(unittest.TestCase):
@@ -44,6 +46,11 @@ class DiagnosticExportTests(unittest.TestCase):
                 subject="Private subject",
                 body="private outreach body",
             )
+            followups = FollowupStore(memory)
+            followups.add_record("c-private", "Private Clinic", contacted_at=time.time(),
+                channel="phone", outcome="note", content="private-followup-note-marker", request_id="private-followup-request")
+            followups.set_plan("c-private", "Private Clinic", due_date="2026-10-03",
+                action="private-followup-plan-marker", request_id="private-plan-request", expected_plan_id=None)
             (store_dir / "private-photo.jpg").write_bytes(b"\xff\xd8\xffprivate")
             (data_dir / "crawler_errors.log").write_text(
                 "ConnectTimeout: customer Private Clinic https://private.example.test sk-private-secret\nHTTP 503",
@@ -126,6 +133,10 @@ class DiagnosticExportTests(unittest.TestCase):
                 "sender@example.test",
                 "fake-app-password",
                 "private-photo.jpg",
+                "private-followup-note-marker",
+                "private-followup-plan-marker",
+                "private-followup-request",
+                "private-plan-request",
                 temp_dir,
             ):
                 self.assertNotIn(private_value, all_content)
