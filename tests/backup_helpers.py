@@ -59,6 +59,48 @@ def make_business_fixture(root: Path) -> BackupLayout:
     return layout
 
 
+def make_constructor_fixture(root: Path, *, groups: tuple[str, ...]) -> BackupLayout:
+    """Initialize ONLY selected current constructors against an owned database."""
+    if len(set(groups)) != len(groups) or not set(groups) <= {"memory", "outreach", "followup"}:
+        raise ValueError("unknown fixture constructor group")
+    layout = resolve_layout(root)
+    layout.data_dir.mkdir(parents=True)
+    (layout.data_dir / "customers.json").write_text(
+        json.dumps([{"id": "customer-甲", "name": "合成甲店"}], ensure_ascii=False), encoding="utf-8")
+    db = layout.data_dir / "tradewind_memory.db"
+    with patch.dict(os.environ, {"TRADEWIND_DATA_DIR": str(root), "MEMORY_DB_PATH": str(db)}):
+        if "memory" in groups:
+            memory = importlib.import_module("app.memory")
+            with patch.object(memory, "MEMORY_DB", db):
+                memory._connect().close()
+        if "outreach" in groups:
+            importlib.import_module("app.outreach_store").OutreachStore(db)
+        if "followup" in groups:
+            importlib.import_module("app.customer_followup").FollowupStore(db)
+    with closing(sqlite3.connect(db)) as conn, conn:
+        if not groups:
+            # connect() alone can leave a zero-byte file. VACUUM persists a
+            # real SQLite header with an empty, valid standard schema.
+            conn.execute("VACUUM")
+        if "memory" in groups:
+            conn.execute("INSERT INTO emails(id,customer,email,created_at,workflow_id) VALUES(7,'合成旧店','历史正文',1704067200,'history-workflow')")
+            conn.execute("UPDATE sqlite_sequence SET seq=70 WHERE name='emails'")
+        if "outreach" in groups:
+            conn.execute("INSERT INTO outreach_jobs(id,workflow_id,customer_id,customer_name_snapshot,channel,provider,recipient,body,content_hash,status,created_at,updated_at) VALUES(11,'job-workflow','deleted-customer','合成旧店','email','qq_smtp','old@shop.example','历史文案',?,'accepted',1704067200,1704067200)",
+                         (hashlib.sha256(b'\0' + '历史文案'.encode()).hexdigest(),))
+            conn.execute("INSERT INTO contact_suppressions(id,channel,normalized_recipient,reason,created_at) VALUES(3,'email','blocked@shop.example','合成规则',1704067200)")
+            conn.execute("UPDATE sqlite_sequence SET seq=110 WHERE name='outreach_jobs'")
+            conn.execute("UPDATE sqlite_sequence SET seq=30 WHERE name='contact_suppressions'")
+        if "followup" in groups:
+            conn.execute("INSERT INTO customer_followup_records VALUES(5,'customer-甲','合成甲店',1704067200,'phone','note','合成沟通',1704067200,'record-request')")
+            conn.execute("INSERT INTO customer_followup_deleted_requests VALUES('deleted-request','customer-甲')")
+            conn.execute("INSERT INTO customer_followup_plans VALUES(9,'customer-甲','合成甲店','2026-10-10','合成事项','superseded',NULL,1704067200,1704067300,'plan-old')")
+            conn.execute("INSERT INTO customer_followup_plans VALUES(13,'customer-甲','合成甲店','2026-10-12','合成后续','active',9,1704067300,NULL,'plan-current')")
+            conn.execute("UPDATE sqlite_sequence SET seq=50 WHERE name='customer_followup_records'")
+            conn.execute("UPDATE sqlite_sequence SET seq=130 WHERE name='customer_followup_plans'")
+    return layout
+
+
 def business_digest(layout: BackupLayout) -> dict[str, str]:
     return {path.relative_to(layout.data_dir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(layout.data_dir.rglob("*")) if path.is_file()

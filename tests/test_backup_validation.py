@@ -18,7 +18,7 @@ import zipfile
 
 from app.backup.models import BackupCancelled, BackupError, BackupLimits
 from app.backup.paths import resolve_layout
-from backup_helpers import business_digest, make_archive, make_business_fixture
+from backup_helpers import business_digest, make_archive, make_business_fixture, make_constructor_fixture
 
 
 class BackupValidationTests(unittest.TestCase):
@@ -67,6 +67,15 @@ class BackupValidationTests(unittest.TestCase):
             conn.executescript(sql)
         self.archive = make_archive(self.layout, self.archive, photos=True)
         self.before = business_digest(self.layout)
+
+    def accepted_constructor_summary(self, folder=None):
+        try:
+            if folder is None:
+                return self.validate().snapshot.summary
+            validator = importlib.import_module("app.backup.validation")
+            return validator.inspect_snapshot(folder, includes_photos=False, limits=BackupLimits())
+        except BackupError as exc:
+            self.fail(f"valid constructor snapshot refused: {exc.code}")
 
     def test_valid_archive_preserves_ids_counts_and_empty_directories(self):
         # Dropping any staged business row/directory or reassigning IDs must fail.
@@ -300,11 +309,120 @@ class BackupValidationTests(unittest.TestCase):
         summary = self.validate().snapshot.summary
         self.assertEqual(summary.counts["emails"], 1)
         self.assertEqual(summary.counts["followup_records"], 0)
+        validator = importlib.import_module("app.backup.validation")
+        inspected = validator.inspect_snapshot(self.layout.data_dir.parent, includes_photos=True, limits=BackupLimits())
+        self.assertEqual(inspected.counts, summary.counts)
+        with closing(sqlite3.connect(self.destination / "data/tradewind_memory.db")) as conn:
+            self.assertEqual(conn.execute("SELECT id FROM emails").fetchall(), [(23,)])
+            self.assertEqual(conn.execute("SELECT seq FROM sqlite_sequence WHERE name='emails'").fetchone(), (23,))
+        self.assertEqual(business_digest(self.layout), self.before)
 
     def test_migrated_column_order_accepted(self):
         # Current schemas can have ALTER-added columns after created_at.
         self.update_db("ALTER TABLE emails RENAME TO old_emails; DROP INDEX uq_emails_workflow; CREATE TABLE emails(id INTEGER PRIMARY KEY AUTOINCREMENT,customer TEXT NOT NULL,country TEXT DEFAULT '',product TEXT DEFAULT '',email TEXT NOT NULL,score REAL DEFAULT 0,created_at REAL NOT NULL,language TEXT DEFAULT 'zh-hant',format TEXT DEFAULT 'email',workflow_id TEXT DEFAULT ''); INSERT INTO emails SELECT id,customer,country,product,email,score,created_at,language,format,workflow_id FROM old_emails; DROP TABLE old_emails; CREATE UNIQUE INDEX uq_emails_workflow ON emails(workflow_id) WHERE workflow_id <> '';")
         self.assertEqual(self.validate().snapshot.summary.counts["emails"], 1)
+
+    def test_complete_current_constructor_group_combinations_preserved(self):
+        # Requiring all constructors, or confusing modern memory-only with
+        # seven-column legacy, must break this independently derived matrix.
+        matrix = [
+            (("memory",), (1, 0, 0, 0, 0, 0, 0)),
+            (("outreach",), (0, 1, 1, 0, 0, 0, 0)),
+            (("followup",), (0, 0, 0, 1, 1, 2, 1)),
+            (("memory", "outreach"), (1, 1, 1, 0, 0, 0, 0)),
+            (("memory", "followup"), (1, 0, 0, 1, 1, 2, 1)),
+            (("outreach", "followup"), (0, 1, 1, 1, 1, 2, 1)),
+            (("memory", "outreach", "followup"), (1, 1, 1, 1, 1, 2, 1)),
+        ]
+        for index, (groups, values) in enumerate(matrix):
+            self.layout = make_constructor_fixture(self.root / f"constructors-{index}", groups=groups)
+            self.before = business_digest(self.layout)
+            self.archive = make_archive(self.layout, self.root / f"constructors-{index}.zip", photos=False)
+            self.destination = self.root / f"staged-{index}"
+            expected = dict(customers=1, products=0, templates=0, crawler_seen=0, photos=0)
+            expected.update(zip(("emails", "outreach_jobs", "suppressions", "followup_records",
+                                 "followup_deleted_requests", "followup_plans", "active_plans"), values))
+            for boundary in ("inspection", "archive"):
+                with self.subTest(groups=groups, boundary=boundary):
+                    if boundary == "inspection":
+                        summary = self.accepted_constructor_summary(self.layout.data_dir.parent)
+                    else:
+                        summary = self.accepted_constructor_summary()
+                        self.assertEqual(business_digest(resolve_layout(self.destination)), self.before)
+                        with closing(sqlite3.connect(self.destination / "data/tradewind_memory.db")) as conn:
+                            if "memory" in groups:
+                                self.assertEqual(conn.execute("SELECT id,workflow_id,language,format FROM emails").fetchall(),
+                                                 [(7, "history-workflow", "zh-hant", "email")])
+                                self.assertEqual(conn.execute("SELECT seq FROM sqlite_sequence WHERE name='emails'").fetchone(), (70,))
+                            if "outreach" in groups:
+                                self.assertEqual(conn.execute("SELECT id,workflow_id,customer_id FROM outreach_jobs").fetchall(),
+                                                 [(11, "job-workflow", "deleted-customer")])
+                                self.assertEqual(conn.execute("SELECT seq FROM sqlite_sequence WHERE name='outreach_jobs'").fetchone(), (110,))
+                                self.assertEqual(conn.execute("SELECT seq FROM sqlite_sequence WHERE name='contact_suppressions'").fetchone(), (30,))
+                            if "followup" in groups:
+                                self.assertEqual(conn.execute("SELECT id,customer_id,request_id FROM customer_followup_records").fetchall(),
+                                                 [(5, "customer-甲", "record-request")])
+                                self.assertEqual(conn.execute("SELECT * FROM customer_followup_deleted_requests").fetchall(), [("deleted-request", "customer-甲")])
+                                self.assertEqual(conn.execute("SELECT id,previous_plan_id FROM customer_followup_plans ORDER BY id").fetchall(), [(9, None), (13, 9)])
+                                self.assertEqual(conn.execute("SELECT seq FROM sqlite_sequence WHERE name='customer_followup_records'").fetchone(), (50,))
+                                self.assertEqual(conn.execute("SELECT seq FROM sqlite_sequence WHERE name='customer_followup_plans'").fetchone(), (130,))
+                    self.assertEqual(summary.counts, expected)
+                    self.assertTrue(summary.items_present["memory"])
+                    self.assertEqual(business_digest(self.layout), self.before)
+
+    def test_empty_standard_sqlite_database_is_distinct_from_missing_database(self):
+        for present in (True, False):
+            self.layout = make_constructor_fixture(self.root / f"empty-db-{present}", groups=())
+            db = self.layout.data_dir / "tradewind_memory.db"
+            self.assertEqual(db.read_bytes()[:16], b"SQLite format 3\x00")
+            if not present:
+                db.unlink()
+            self.before = business_digest(self.layout)
+            self.archive = make_archive(self.layout, self.root / f"empty-db-{present}.zip", photos=False)
+            self.destination = self.root / f"empty-staged-{present}"
+            for boundary in ("inspection", "archive"):
+                with self.subTest(present=present, boundary=boundary):
+                    summary = (self.accepted_constructor_summary(self.layout.data_dir.parent)
+                        if boundary == "inspection" else self.accepted_constructor_summary())
+                    self.assertEqual(summary.items_present["memory"], present)
+                    self.assertEqual(summary.counts, dict(customers=1, products=0, templates=0,
+                        crawler_seen=0, photos=0, emails=0, outreach_jobs=0, suppressions=0,
+                        followup_records=0, followup_deleted_requests=0, followup_plans=0, active_plans=0))
+                    self.assertEqual(business_digest(self.layout), self.before)
+                    if boundary == "archive":
+                        self.assertEqual((self.destination / "data/tradewind_memory.db").exists(), present)
+
+    def test_current_constructor_groups_stay_strict_for_incomplete_or_future_schemas(self):
+        # Accepting subsets must never discard required tables/indexes or make
+        # unknown columns/objects acceptable within a present current group.
+        mutations = [
+            (("memory",), "DROP INDEX uq_emails_workflow;"),
+            (("memory",), "ALTER TABLE emails ADD COLUMN future TEXT;"),
+            (("memory",), "ALTER TABLE emails DROP COLUMN workflow_id;"),
+            (("outreach",), "DROP TABLE contact_suppressions;"),
+            (("outreach",), "DROP INDEX uq_outreach_workflow;"),
+            (("followup",), "DROP TABLE customer_followup_deleted_requests;"),
+            (("followup",), "DROP INDEX uq_followup_active_customer;"),
+            (("followup",), "UPDATE customer_followup_records SET customer_id='absent';"),
+            ((), "CREATE TABLE future(value TEXT);"),
+            ((), "CREATE VIEW future AS SELECT 1;"),
+        ]
+        validator = importlib.import_module("app.backup.validation")
+        for index, (groups, sql) in enumerate(mutations):
+            self.layout = make_constructor_fixture(self.root / f"invalid-group-{index}", groups=groups)
+            with closing(sqlite3.connect(self.layout.data_dir / "tradewind_memory.db")) as conn, conn:
+                # Drop the dependent index before testing a middle memory
+                # shape lacking workflow_id, never treat it as early legacy.
+                if "DROP COLUMN" in sql:
+                    conn.execute("DROP INDEX uq_emails_workflow")
+                conn.executescript(sql)
+            self.before = business_digest(self.layout)
+            self.archive = make_archive(self.layout, self.root / f"invalid-group-{index}.zip", photos=False)
+            self.destination = self.root / f"invalid-staged-{index}"
+            with self.subTest(groups=groups, sql=sql):
+                with self.assertRaises(BackupError):
+                    validator.inspect_snapshot(self.layout.data_dir.parent, includes_photos=False, limits=BackupLimits())
+                self.reject()
 
     def test_actual_deflate_bytes_exceed_forged_declarations(self):
         # Forged central/local sizes must not hide the real deflate output.

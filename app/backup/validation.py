@@ -464,21 +464,31 @@ def _table_signature(conn, table):
 def _schema(conn):
     objects = list(conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master"))
     tables = {name for kind, name, _, _ in objects if kind == "table"}
-    _check("emails" in tables, "unsupported_schema")
     business = tables - {"sqlite_sequence"}
-    # Explicit supported snapshots: earliest seven-column memory-only, or
-    # all six current business tables. Partial/middle versions are refused.
-    early = business == {"emails"}
-    _check(early or business == set(_TABLE_COUNTS), "unsupported_schema")
+    # Current constructors initialize independently. Accept their complete
+    # groups (including none), never a partial group or an unknown table.
+    groups = ({"emails"}, {"outreach_jobs", "contact_suppressions"},
+              {"customer_followup_records", "customer_followup_deleted_requests", "customer_followup_plans"})
+    _check(business <= set(_TABLE_COUNTS), "unsupported_schema")
+    _check(all(not business.intersection(group) or group <= business for group in groups), "unsupported_schema")
+    # Legacy remains a separate exact seven-column, memory-only variant.
+    # Modern memory-only must retain language/format/workflow and its index.
+    early = (business == {"emails"} and
+             {row[1] for row in conn.execute('PRAGMA table_xinfo("emails")')} ==
+             {"id", "customer", "country", "product", "email", "score", "created_at"})
     for kind, name, table, sql in objects:
         _check(kind in {"table", "index"} and (table in business or name == "sqlite_sequence"), "unsupported_schema")
         if kind == "table":
             _check(sql and not re.search(r"\bvirtual\b", sql, re.I), "unsupported_schema")
     with closing(sqlite3.connect(":memory:")) as reference:
-        reference.execute(_EMAIL_EARLY if early else _EMAIL_CURRENT)
-        if not early:
-            reference.execute("CREATE UNIQUE INDEX uq_emails_workflow ON emails(workflow_id) WHERE workflow_id <> ''")
-            reference.executescript(_OUTREACH_DDL + _FOLLOWUP_DDL)
+        if "emails" in business:
+            reference.execute(_EMAIL_EARLY if early else _EMAIL_CURRENT)
+            if not early:
+                reference.execute("CREATE UNIQUE INDEX uq_emails_workflow ON emails(workflow_id) WHERE workflow_id <> ''")
+        if "outreach_jobs" in business:
+            reference.executescript(_OUTREACH_DDL)
+        if "customer_followup_records" in business:
+            reference.executescript(_FOLLOWUP_DDL)
         _check(tables == {row[0] for row in reference.execute("SELECT name FROM sqlite_master WHERE type='table'")}, "unsupported_schema")
         for table in sorted(tables):
             _check(_table_signature(conn, table) == _table_signature(reference, table), "unsupported_schema")
@@ -603,7 +613,7 @@ def _database(path, customer_ids, counts, cancel):
                            plans[previous]["customer_id"] == plan["customer_id"] and
                            plans[previous]["status"] == "superseded", "invalid_database")
             sequences = set()
-            for row in conn.execute("SELECT name,seq FROM sqlite_sequence"):
+            for row in (conn.execute("SELECT name,seq FROM sqlite_sequence") if tables else ()):
                 _check(row["name"] in max_ids and row["name"] not in sequences, "invalid_database")
                 _check(type(row["seq"]) is int and max_ids[row["name"]] <= row["seq"] < 2**63 - 1, "invalid_database")
                 sequences.add(row["name"])
