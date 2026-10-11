@@ -3,9 +3,10 @@ import type {
   ConfigState, CrawlerState, CrawlerTarget, Customer, EmailOutreachSettings, EmailResult,
   ExtractTask, HistoryItem, Lang, OutFormat, OutreachChannel, OutreachJob,
   OutreachStatus, OutreachSuppression, PhotoLibraryStore, PhotoTaskState, Product,
-  TaskState, Template,
+  TaskState, Template, BackupState,
   FollowupChannel, FollowupOutcome, FollowupRecord, FollowupPlan, FollowupSummary, FollowupTimelinePage,
 } from "./types";
+import { getDataSafetyState, getPageEpoch, initializeDataEpoch, markDataMaintenance, markDataStale, refreshDataSafety } from "./dataEpoch";
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
@@ -18,16 +19,34 @@ export function apiUrl(url: string): string {
 }
 
 async function req<T>(url: string, opts?: RequestInit): Promise<T> {
-  const resp = await fetch(apiUrl(url), opts);
+  await initializeDataEpoch();
+  const control = url.startsWith("/api/backup/");
+  const mutation = !["GET", "HEAD"].includes((opts?.method || "GET").toUpperCase());
+  if (!control) await refreshDataSafety();
+  const safety = getDataSafetyState();
+  if (safety.mode === "stale" || (!control && safety.mode !== "ready")) throw new Error(safety.message);
+  const mergedHeaders = new Headers(opts?.headers);
+  if (mutation) mergedHeaders.set("X-Tradewind-Data-Epoch", getPageEpoch()!);
+  const resp = await fetch(apiUrl(url), { ...opts, headers: mergedHeaders });
   if (!resp.ok) {
     let detail = "";
     try {
       const j = await resp.json();
       detail = j.detail || j.error || "";
+      if (resp.status === 409 && j.code === "stale_epoch") markDataStale();
+      if (resp.status === 503 && j.code === "maintenance_busy") markDataMaintenance();
     } catch { /* ignore */ }
     throw new Error(detail || `请求失败（${resp.status}）`);
   }
-  return resp.json() as Promise<T>;
+  const result = await resp.json() as T;
+  // In-flight task/list reads can finish after restart. Never deliver not_found
+  // or new-root data to a still-mounted old form before reconciling safety.
+  if (!control) {
+    await refreshDataSafety(true);
+    const after = getDataSafetyState();
+    if (after.mode !== "ready") throw new Error(after.message);
+  }
+  return result;
 }
 
 async function downloadResponse(url: string): Promise<string> {
@@ -55,7 +74,19 @@ async function downloadResponse(url: string): Promise<string> {
 const post = <T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> =>
   req<T>(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
 
+async function postEmail<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  // Read current local configuration only on an explicit generation action.
+  // A settings save must work without remounting App, and no-key browsing must
+  // not start a model-backed task merely to discover that configuration is absent.
+  const config = await req<ConfigState>("/api/config");
+  if (!config.has_key) throw new Error("请先在设置中配置 API Key，再生成开发信");
+  return post<T>(url, body, signal);
+}
+
 export const api = {
+  backup: {
+    state: (): Promise<BackupState> => refreshDataSafety(),
+  },
   getConfig: () => req<ConfigState>("/api/config"),
   saveKey: (provider: string, apiKey: string) =>
     post<{ ok: boolean; error?: string; verified?: boolean | null }>("/api/config", { provider, api_key: apiKey }),
@@ -76,15 +107,15 @@ export const api = {
   exportDiagnostics: () => downloadResponse("/api/diagnostics/export"),
 
   email: (p: { customer: string; country?: string; product?: string; extra?: string; judge?: boolean; language?: Lang; format?: OutFormat }, signal?: AbortSignal) =>
-    post<EmailResult>("/api/email", p, signal),
+    postEmail<EmailResult>("/api/email", p, signal),
 
   startEmail: (p: { customer_id?: string; customer: string; country?: string; product?: string; extra?: string; judge?: boolean; language?: Lang; format?: OutFormat; template_id?: string }) =>
-    post<{ task_id: string; error?: string }>("/api/email/start", p),
+    postEmail<{ task_id: string; error?: string }>("/api/email/start", p),
   cancelTask: (taskId: string) =>
     post<{ ok: boolean; error?: string }>(`/api/email/tasks/${taskId}/cancel`, {}),
 
   startBatch: (rows: { name: string; country?: string; notes?: string }[], product: string, judge: boolean, language?: Lang, format?: OutFormat, templateId = "") =>
-    post<{ task_id: string; error?: string }>("/api/email/batch", { rows, product, judge, language, format, template_id: templateId }),
+    postEmail<{ task_id: string; error?: string }>("/api/email/batch", { rows, product, judge, language, format, template_id: templateId }),
   task: (taskId: string) => req<TaskState>(`/api/email/tasks/${taskId}`),
 
   products: {

@@ -4,6 +4,7 @@
 
 import { api } from "./api";
 import type { TaskState } from "./types";
+import { getBootstrapBackupState, getDataSafetyState } from "./dataEpoch";
 
 type Listener<T> = (t: T) => void;
 type TaskLike = { status: string };
@@ -13,6 +14,25 @@ const subs = new Map<string, Set<(t: unknown) => void>>();
 const timers = new Map<string, number>();
 const lastByKind = new Map<string, string>();
 const STORAGE_PREFIX = "tradewind.task.";
+let referencesInitialized = false;
+
+/** Fresh App boot only. Never clear mounted drafts or backend checkpoints. */
+export function resetTaskReferencesForEpoch(epoch: string): void {
+  if (referencesInitialized) return;
+  referencesInitialized = true;
+  timers.forEach(timer => window.clearInterval(timer));
+  timers.clear(); subs.clear(); lastByKind.clear();
+  try {
+    const prior = window.localStorage.getItem(`${STORAGE_PREFIX}epoch`);
+    const restored = getBootstrapBackupState()?.require_header ?? true;
+    if ((prior !== null && prior !== epoch) || (prior === null && restored)) {
+      window.localStorage.removeItem(`${STORAGE_PREFIX}compose`);
+    }
+    window.localStorage.setItem(`${STORAGE_PREFIX}epoch`, epoch);
+  } catch {
+    // Storage restrictions must not prevent viewing local data.
+  }
+}
 
 function rememberTask(kind: string, taskId: string): void {
   lastByKind.set(kind, taskId);
@@ -49,36 +69,27 @@ export function watchTask<T extends TaskLike = TaskState>(
   subs.get(taskId)!.add(listener as (t: unknown) => void);
 
   if (!timers.has(taskId)) {
-    // 立即拉一次最新状态（切回页面时马上恢复显示）
-    fetcher(taskId)
-      .then((t) => {
-        if (!subs.has(taskId)) return;
-        subs.get(taskId)!.forEach((l) => l(t as unknown));
-        if (t.status === "not_found") forgetTask(kind, taskId);
-        if (finished(t.status)) return; // 已结束不再建轮询
-        if (timers.has(taskId)) return;
-        timers.set(
-          taskId,
-          window.setInterval(async () => {
-            let t2: T;
-            try {
-              t2 = await fetcher(taskId);
-            } catch {
-              return; // 轮询失败继续，下次再试
-            }
-            if (!subs.has(taskId)) return;
-            subs.get(taskId)!.forEach((l) => l(t2 as unknown));
-            if (finished(t2.status)) {
-              window.clearInterval(timers.get(taskId)!);
-              timers.delete(taskId);
-              if (t2.status === "not_found") forgetTask(kind, taskId);
-            }
-          }, 1000),
-        );
-      })
-      .catch(() => {
-        /* 立即拉取失败（网络抖动），等轮询兜底 */
-      });
+    let pending = false;
+    const poll = async () => {
+      if (pending || getDataSafetyState().mode === "stale") return;
+      pending = true;
+      try {
+        const task = await fetcher(taskId);
+        if (!subs.has(taskId) || getDataSafetyState().mode !== "ready") return;
+        subs.get(taskId)!.forEach(callback => callback(task));
+        if (finished(task.status)) {
+          window.clearInterval(timers.get(taskId)!);
+          timers.delete(taskId);
+          if (task.status === "not_found") forgetTask(kind, taskId);
+        }
+      } catch {
+        // Initial failure and maintenance failure both keep the retry timer.
+      } finally {
+        pending = false;
+      }
+    };
+    timers.set(taskId, window.setInterval(() => { void poll(); }, 1000));
+    void poll(); // Immediate recovery on remount, without overlapping requests.
   }
   return () => {
     subs.get(taskId)?.delete(listener as (t: unknown) => void);

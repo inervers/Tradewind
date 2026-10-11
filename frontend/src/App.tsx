@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode, type SyntheticEvent } from "react";
 import { AuroraBackground, FadeIn, useToast } from "./components/effects";
 import {
   BatchIcon, BoxIcon, ClockIcon, GearIcon, InboxIcon, MailIcon, PhotoIcon, RadarIcon, RouteIcon, SailboatIcon, UsersIcon,
@@ -15,7 +15,10 @@ import HistoryTab from "./tabs/HistoryTab";
 import TemplatesTab from "./tabs/TemplatesTab";
 import SettingsTab from "./tabs/SettingsTab";
 import OutreachTab from "./tabs/OutreachTab";
-import type { ComposeSeed } from "./types";
+import type { ComposeSeed, DataSafetyState } from "./types";
+import DataMaintenanceNotice from "./components/DataMaintenanceNotice";
+import { getDataSafetyState, getPageEpoch, initializeDataEpoch, subscribeDataSafety } from "./dataEpoch";
+import { resetTaskReferencesForEpoch } from "./tasks";
 
 type TabKey = "compose" | "batch" | "customers" | "outreach" | "crawler" | "photos" | "products" | "templates" | "history" | "settings";
 
@@ -125,6 +128,11 @@ function Stamp() {
 
 export default function App() {
   const [view, setView] = useState<"loading" | "setup" | "main">("loading");
+  const [dataSafety, setDataSafety] = useState<DataSafetyState>(getDataSafetyState);
+  const [bootReady, setBootReady] = useState(false);
+  // Fresh maintenance boot has no business components. Once mounted, changing
+  // safety mode must never replace them and discard local form state.
+  const [bootRestricted, setBootRestricted] = useState(true);
   const [tab, setTab] = useState<TabKey>("compose");
   const [hasKey, setHasKey] = useState(false);
   const [apiKey, setApiKey] = useState("");
@@ -134,20 +142,40 @@ export default function App() {
   const [followupDirty, setFollowupDirty] = useState(false);
   const [followupBusy, setFollowupBusy] = useState(false);
   const [pendingNavigation, setPendingNavigation] = useState<{ tab: TabKey; seed?: ComposeSeed } | null>(null);
+  const checkingGeneration = useRef(new WeakSet<HTMLButtonElement>());
+  const checkedGeneration = useRef(new WeakSet<HTMLButtonElement>());
   const toast = useToast();
 
   const navigate = useCallback((destination: TabKey, seed?: ComposeSeed) => {
     if (destination === tab && !seed) return;
+    if (!bootRestricted && getDataSafetyState().mode !== "ready") {
+      toast.push("请先复制需要的草稿，资料可操作后再切换页面", "info"); return;
+    }
     if (followupBusy) { toast.push("跟进正在保存，请稍候再切换页面", "info"); return; }
     if (followupDirty) { setPendingNavigation({ tab: destination, seed }); return; }
     if (seed) setComposeSeed(seed);
     setTab(destination);
-  }, [tab, followupDirty, followupBusy, toast.push]);
+  }, [tab, bootRestricted, followupDirty, followupBusy, toast.push]);
   const startOutreach = useCallback((seed: ComposeSeed) => {
     navigate("compose", seed);
   }, [navigate]);
 
   useEffect(() => {
+    let cancelled = false;
+    const unsubscribe = subscribeDataSafety(setDataSafety);
+    void initializeDataEpoch().then(() => {
+      if (cancelled) return;
+      resetTaskReferencesForEpoch(getPageEpoch()!);
+      setBootReady(true);
+      if (getDataSafetyState().mode !== "ready") setView("main");
+    }).catch(() => {
+      if (!cancelled) { setBootReady(true); setView("main"); }
+    });
+    return () => { cancelled = true; unsubscribe(); };
+  }, []);
+
+  useEffect(() => {
+    if (!bootReady || !bootRestricted || dataSafety.mode !== "ready" || !getPageEpoch()) return;
     let cancelled = false;
     const deadline = Date.now() + 60_000;
     const loadConfig = async () => {
@@ -156,11 +184,16 @@ export default function App() {
           const config = await api.getConfig();
           if (cancelled) return;
           setHasKey(config.has_key);
+          setBootRestricted(false);
           setView(config.has_key ? "main" : "setup");
           return;
         } catch {
+          if (getDataSafetyState().mode !== "ready") {
+            if (!cancelled) setView("main");
+            return;
+          }
           if (Date.now() >= deadline) {
-            if (!cancelled) setView("setup");
+            if (!cancelled) { setError("设置暂时无法读取，请稍后重新打开页面。"); setView("main"); }
             return;
           }
           await new Promise((resolve) => window.setTimeout(resolve, 400));
@@ -171,7 +204,37 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [bootReady, bootRestricted, dataSafety.mode]);
+
+  // Capture before existing handlers clear results or start saving. React also
+  // carries portal form events here, so follow-up drafts remain editable and
+  // copyable without adding safety code to each business component.
+  const guardBusinessAction = (event: SyntheticEvent) => {
+    const state = getDataSafetyState();
+    const target = event.target as HTMLElement;
+    const button = target.closest("button");
+    if (event.type === "click" && !button) return;
+    if (state.mode !== "ready") {
+      if (button && /复制|下载|关闭|取消/.test(button.getAttribute("aria-label") || button.title || button.textContent || "")) return;
+      event.preventDefault(); event.stopPropagation();
+      toast.push(state.message, "info");
+    } else if (event.type === "click" && button && /生成开发信|开始批量生成/.test(button.textContent || "")) {
+      if (checkedGeneration.current.delete(button)) return;
+      // These handlers clear the previous generated draft before awaiting api.
+      // Reconcile first, so a restore just before the click cannot erase it.
+      event.preventDefault(); event.stopPropagation();
+      if (checkingGeneration.current.has(button)) return;
+      checkingGeneration.current.add(button);
+      void api.getConfig().then(config => {
+        if (!config.has_key) { toast.push("请先在设置中配置 API Key，再生成开发信", "info"); return; }
+        if (button.isConnected && !button.disabled) {
+          checkedGeneration.current.add(button);
+          button.click();
+        }
+      }).catch(error => toast.push(error instanceof Error ? error.message : "暂不能生成，请稍后重试", "info"))
+        .finally(() => checkingGeneration.current.delete(button));
+    }
+  };
 
   const saveKey = useCallback(async () => {
     setSaving(true);
@@ -202,6 +265,7 @@ export default function App() {
         <AuroraBackground />
         <div className="card setup-card">
           <BrandMark />
+          <DataMaintenanceNotice state={dataSafety} />
           <h1 className="page-title" style={{ fontSize: 20, marginBottom: 6 }}>
             首次使用
           </h1>
@@ -223,6 +287,7 @@ export default function App() {
             <button className="btn btn-primary" onClick={saveKey} disabled={saving || !apiKey.trim()}>
               {saving ? "验证中…" : "保存并进入"}
             </button>
+            <button type="button" className="btn btn-ghost" style={{ minHeight: 44 }} onClick={() => setView("main")}>暂不配置，查看本机资料</button>
           </div>
         </div>
         {toast.el}
@@ -255,6 +320,9 @@ export default function App() {
       </aside>
       <main className="main">
         <TradeRoutes />
+        <DataMaintenanceNotice state={dataSafety} />
+        {bootRestricted && error && <p role="alert">{error}</p>}
+        {!bootRestricted && <div onClickCapture={guardBusinessAction} onSubmitCapture={guardBusinessAction}>
         <FadeIn key={tab}>
           {tab === "compose" && (
             <ComposeTab
@@ -273,6 +341,7 @@ export default function App() {
           {tab === "history" && <HistoryTab />}
           {tab === "settings" && <SettingsTab />}
         </FadeIn>
+        </div>}
       </main>
       <Stamp />
       {toast.el}

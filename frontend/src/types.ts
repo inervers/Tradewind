@@ -1,5 +1,39 @@
 // ---------- 数据模型 ----------
 
+export interface DataSafetyState {
+  mode: "ready" | "maintenance" | "prepared" | "stale" | "blocked";
+  message: string;
+}
+
+export interface BackupSummary {
+  format_version: number; app_version: string; created_at: string; includes_photos: boolean;
+  items_present: Record<"customers" | "products" | "templates" | "memory" | "crawler_seen" | "crawler_photos" | "photo_scan", boolean>;
+  counts: BackupCounts;
+}
+export type BackupCounts = Record<"customers" | "products" | "templates" | "crawler_seen" | "emails" | "outreach_jobs" | "suppressions" | "followup_records" | "followup_deleted_requests" | "followup_plans" | "active_plans" | "photos", number>;
+export interface RestorePreview {
+  id: string; archive_sha256: string; epoch: string; revision: number; expires_at: number;
+  backup: BackupSummary; current: BackupSummary;
+}
+export interface PreparedRestore { operation_id: string; rescue_id: string; status: "prepared" }
+export interface RestoreOutcome {
+  status: "none" | "restored" | "rolled_back" | "blocked";
+  operation_id: string; code: string; counts: BackupCounts;
+}
+export interface OperationView {
+  id: string; kind: "export" | "preview" | "prepare";
+  status: "running" | "done" | "cancelled" | "error";
+  phase: string; completed: number; total: number; code: string; message: string;
+  preview: RestorePreview | null; prepared: PreparedRestore | null;
+}
+export interface RescueView { id: string; created_at: string; size_bytes: number; active: boolean }
+export interface BackupState {
+  mode: "ready" | "snapshot" | "prepare" | "prepared" | "blocked";
+  epoch: string; require_header: boolean; revision: number;
+  prepared: PreparedRestore | null; rescues: RescueView[]; report: RestoreOutcome;
+  estimated_bytes: number; photo_count: number;
+}
+
 export interface Product {
   id: string;
   title: string;
