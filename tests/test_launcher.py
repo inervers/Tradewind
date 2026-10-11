@@ -1,4 +1,6 @@
 import os
+import builtins
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,32 @@ import run
 
 
 class LauncherTests(unittest.TestCase):
+    def test_import_failure_is_caught_without_private_exception_or_browser_start(self) -> None:
+        original = builtins.__import__
+        def blocked(name, *args, **kwargs):
+            if name == "server":
+                from app.backup.models import BackupError
+                raise BackupError("restore_blocked", "private-path-should-not-print")
+            return original(name, *args, **kwargs)
+        output = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory(prefix="task6-launcher-") as directory,
+            patch.object(run, "is_tradewind_ready", return_value=False),
+            patch.object(run, "acquire_instance_mutex", return_value=False),
+            patch.object(run, "port_is_in_use", return_value=False),
+            patch.object(run, "configure_runtime_data", return_value=Path(directory)),
+            patch.object(run.threading, "Thread", side_effect=AssertionError("browser thread must not start")),
+            patch("builtins.__import__", side_effect=blocked),
+            patch("builtins.input", return_value=""),
+            patch("sys.stdout", output),
+        ):
+            try:
+                result = run.main()
+            except Exception as exc:
+                result = exc
+        self.assertEqual(result, 1)
+        self.assertNotIn("private-path-should-not-print", output.getvalue())
+        self.assertIn("救援", output.getvalue())
     def test_health_check_uses_proxy_free_local_opener(self) -> None:
         response = MagicMock()
         response.status = 200

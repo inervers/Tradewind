@@ -1,7 +1,7 @@
 """Owned synthetic backup fixtures, independent of the production exporter."""
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, ExitStack
 import hashlib
 import importlib
 import json
@@ -161,7 +161,33 @@ def make_archive(layout: BackupLayout, destination: Path, *, photos: bool) -> Pa
 
 
 @contextmanager
-def open_fixture_server(layout: BackupLayout):
-    """Task6 supplies the HTTP fixture; never fall back to the live server."""
-    raise NotImplementedError("Task6 must supply an isolated fixture server")
-    yield  # pragma: no cover
+def open_fixture_server(layout: BackupLayout, *, memory_path: Path | None = None):
+    """Fresh source app and full middleware stack, owned data only, no network."""
+    import importlib.util
+    import sys
+    import uuid
+    from fastapi.testclient import TestClient
+    from app import config, memory
+    memory_path = memory_path or layout.data_dir / "tradewind_memory.db"
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(config, "ROOT_DIR", layout.data_dir.parent))
+        stack.enter_context(patch.object(config, "CONFIG_FILE", layout.data_dir / "config.json"))
+        stack.enter_context(patch.object(config.settings, "memory_db_path", str(memory_path)))
+        stack.enter_context(patch.object(memory, "MEMORY_DB", memory_path))
+        name = "_backup_fixture_server_" + uuid.uuid4().hex
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / "server.py")
+        module = importlib.util.module_from_spec(spec)
+        stack.enter_context(patch.dict(sys.modules, {name: module}))
+        spec.loader.exec_module(module)
+        client = stack.enter_context(TestClient(module.app))
+        client.server = module
+        try:
+            yield client
+        finally:
+            service = getattr(module, "backup_service", None)
+            if service:
+                for operation in list(service._operations.values()):
+                    if operation.thread is not None:
+                        operation.thread.join(timeout=15)
+                        if operation.thread.is_alive():
+                            raise AssertionError("owned backup worker did not finish")

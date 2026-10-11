@@ -59,6 +59,8 @@ class DormantThread:
 
     def start(self) -> None:
         type(self).starts += 1
+        if hasattr(self.target, "__self__") and hasattr(self.target.__self__, "abort_start"):
+            type(self).tickets.append(self.target.__self__)
 
 
 class FakeApprovalWorkflow:
@@ -107,18 +109,51 @@ class ServerOutreachTests(unittest.TestCase):
         )
         FakeCredentialStore.values = {}
         DormantThread.starts = 0
+        DormantThread.tickets = []
+        from app.backup.maintenance import MaintenanceCoordinator
+        from app.backup.paths import resolve_layout
+        self.coordinator = MaintenanceCoordinator(resolve_layout(root))
         self.patches = [
             patch.object(server, "CUSTOMERS_FILE", self.customers),
             patch.object(server, "MEMORY_DB_FILE", self.db),
             patch.object(app_config, "CONFIG_FILE", self.config),
+            patch.object(server, "backup_coordinator", self.coordinator, create=True),
         ]
         for item in self.patches:
             item.start()
 
     def tearDown(self) -> None:
+        for ticket in DormantThread.tickets:
+            ticket.abort_start()
         for item in reversed(self.patches):
             item.stop()
         self.tmp.cleanup()
+
+    def test_missing_customer_rejected_at_send_and_actual_worker_before_credentials(self):
+        created = self.create_email()
+        self.customers.write_text("[]", encoding="utf-8")
+        with (
+            patch.object(server, "CredentialStore", side_effect=AssertionError("credential must not be read")),
+            patch.object(server.SmtpSender, "send", side_effect=AssertionError("SMTP must not run")),
+        ):
+            response = server.api_outreach_send_email(created["id"])
+            self.assertFalse(response["ok"])
+            self.assertEqual(response.get("code"), "customer_missing")
+            OutreachStore(self.db).claim_email_send(created["id"])
+            server._execute_claimed_outreach_email(created["id"])
+        item = OutreachStore(self.db).get_job(created["id"])
+        self.assertEqual((item["status"], item["error_code"]), ("failed", "customer_missing"))
+        self.assertEqual(server.api_outreach_jobs()[0]["id"], created["id"])
+
+    def test_missing_customer_cannot_open_whatsapp_but_history_remains(self):
+        created = server.api_outreach_create(server.OutreachCreateRequest(customer_id="c-001", channel="whatsapp", content="owned"))["item"]
+        self.customers.write_text("[]", encoding="utf-8")
+        with patch.object(server, "build_whatsapp_link", side_effect=AssertionError("WA must not open")):
+            result = server.api_outreach_open_whatsapp(created["id"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result.get("code"), "customer_missing")
+        self.assertEqual(OutreachStore(self.db).get_job(created["id"])["status"], "pending_review")
+        self.assertEqual(server.api_outreach_jobs()[0]["id"], created["id"])
 
     def create_email(self) -> dict:
         with (

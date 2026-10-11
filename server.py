@@ -34,6 +34,8 @@ warnings.filterwarnings("ignore", message="Couldn't find ffmpeg or avconv.*")
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -47,6 +49,27 @@ from app.config import (
     set_company_profile, set_email_outreach_config, set_provider_params,
     set_vision_config, settings, vision_key_format_error,
 )
+# Recovery and epoch validation MUST precede business imports, default seeding,
+# lazy SQLite constructors, and startup orphan/queue cleanup.
+from app.backup.models import BackupError, BackupLimits
+from app.backup.paths import resolve_layout
+from app.backup.restore import apply_pending_restore
+from app.backup.maintenance import MaintenanceCoordinator
+from app.backup.service import BackupService
+from app.backup.http import (BackupMaintenanceMiddleware, _DownloadLifetime,
+                             backup_router, error_response, start_registered_worker,
+                             _track_db_initialization)
+from app.version import APP_VERSION
+
+BACKUP_LAYOUT = resolve_layout(ROOT_DIR)
+BACKUP_OUTCOME = apply_pending_restore(BACKUP_LAYOUT, memory_path=Path(settings.memory_db_path), limits=BackupLimits())
+if BACKUP_OUTCOME.status == "blocked":
+    raise BackupError(BACKUP_OUTCOME.code, "恢复状态无法安全确认，请保留救援备份并联系维护人员。")
+backup_coordinator = MaintenanceCoordinator(BACKUP_LAYOUT)
+backup_service = BackupService(BACKUP_LAYOUT, memory_path=Path(settings.memory_db_path),
+    app_version=APP_VERSION, coordinator=backup_coordinator, limits=BackupLimits())
+backup_service._report = BACKUP_OUTCOME
+
 from app.credential_store import CredentialStore, CredentialUnavailable
 from app.customer_followup import FollowupConflict, FollowupNotFound, FollowupStore, paginate_timeline
 from app.email_agent import GenerationCancelled, generate_email
@@ -73,7 +96,6 @@ from app.outreach_store import (
 from app.task_utils import prune_finished_tasks
 
 ROOT = ROOT_DIR
-APP_VERSION = "0.2.0"
 
 
 def _resolve_frontend_dist() -> Path | None:
@@ -150,14 +172,6 @@ def is_trusted_mutation_origin(method: str, origin: str | None) -> bool:
 
 app = FastAPI(title="Tradewind", version=APP_VERSION)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=sorted(LOCAL_UI_ORIGINS),
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type"],
-)
-
-
 @app.middleware("http")
 async def reject_untrusted_browser_origins(request: Request, call_next):
     if request.url.path.startswith("/api/") and not is_trusted_mutation_origin(
@@ -165,9 +179,43 @@ async def reject_untrusted_browser_origins(request: Request, call_next):
     ):
         return JSONResponse(
             status_code=403,
-            content={"detail": "不允许从该网页来源修改本机数据"},
+            content={"detail": "不允许从该网页来源修改本机数据", "code": "untrusted_origin"},
         )
     return await call_next(request)
+
+
+@app.exception_handler(BackupError)
+async def backup_exception_handler(request: Request, exc: BackupError):
+    return error_response(exc)
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_backup_validation_error(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/api/backup/"):
+        return error_response(BackupError("invalid_request", "备份请求格式无效。"))
+    return await request_validation_exception_handler(request, exc)
+
+
+app.state.backup_business_db_paths = lambda: (MEMORY_DB_FILE, Path(settings.memory_db_path))
+app.include_router(backup_router(backup_service))
+# Latest insertion is outermost, above the Origin BaseHTTP stream intermediary.
+app.add_middleware(BackupMaintenanceMiddleware, coordinator=backup_coordinator)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=sorted(LOCAL_UI_ORIGINS),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Tradewind-Data-Epoch"],
+)
+app.add_middleware(_DownloadLifetime)
+
+
+def _owned_startup(function):
+    @wraps(function)
+    def initialize():
+        with backup_coordinator.service(None, mutating=False), _track_db_initialization(
+                backup_coordinator, app.state.backup_business_db_paths()):
+            return function()
+    return initialize
 
 
 # ---------- 工具 ----------
@@ -872,7 +920,7 @@ def api_email_start(req: EmailRequest) -> dict:
         except Exception as exc:  # noqa: BLE001
             _finish(task_id, "error", error=str(exc))
 
-    threading.Thread(target=execute, daemon=True).start()
+    start_registered_worker(backup_coordinator, "single_email", execute)
     return {"task_id": task_id}
 
 
@@ -933,11 +981,8 @@ def api_batch(req: BatchRequest) -> dict:
     if req.template_id and template_record is None:
         return {"task_id": "", "error": "所选话术模板不存在，请刷新后重试"}
     task_id = _new_task(len(req.rows))
-    threading.Thread(
-        target=_run_batch,
-        args=(task_id, req.rows, req.product, req.judge, req.language, req.format, template_record),
-        daemon=True,
-    ).start()
+    start_registered_worker(backup_coordinator, "batch", _run_batch,
+        (task_id, req.rows, req.product, req.judge, req.language, req.format, template_record))
     return {"task_id": task_id}
 
 
@@ -1230,7 +1275,12 @@ async def _start_extract(file: UploadFile, kind: str) -> dict:
         "items": [], "mode": "", "ocr": False,
         "filename": file.filename or "", "created_at": time.time(),
     }
-    threading.Thread(target=_run_extract, args=(task_id, tmp, kind), daemon=True).start()
+    try:
+        start_registered_worker(backup_coordinator, "document", _run_extract, (task_id, tmp, kind))
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        EXTRACT_TASKS.pop(task_id, None)
+        raise
     return {"ok": True, "task_id": task_id}
 
 
@@ -1627,7 +1677,12 @@ def api_photos_start(req: PhotoScanRequest) -> dict:
             "status": "running", "cancel": False, "total": len(req.images), "done": 0,
             "results": [], "error": "", "created_at": time.time(),
         }
-    threading.Thread(target=_run_photo_scan, args=(task_id, req.images), daemon=True).start()
+    try:
+        start_registered_worker(backup_coordinator, "photo", _run_photo_scan, (task_id, req.images))
+    except Exception:
+        PHOTO_RUN_LOCK.release()
+        PHOTO_TASKS.pop(task_id, None)
+        raise
     return {"task_id": task_id}
 
 
@@ -2221,7 +2276,7 @@ def api_crawler_start(req: CrawlerRequest) -> dict:
             CRAWLER_RUN_LOCK.release()
 
     try:
-        threading.Thread(target=run, daemon=True).start()
+        start_registered_worker(backup_coordinator, "crawler", run)
     except Exception:
         CRAWLER_RUN_LOCK.release()
         CRAWLER_TASKS.pop(task_id, None)
@@ -2409,12 +2464,15 @@ def api_outreach_update(job_id: int, req: OutreachContentRequest) -> dict:
 
 
 @app.post("/api/outreach/jobs/{job_id}/open-whatsapp")
+@_customer_locked
 def api_outreach_open_whatsapp(job_id: int) -> dict:
     try:
         store = _outreach_store()
         job = store.get_job(job_id)
         if job["channel"] != "whatsapp":
             return {"ok": False, "error": "该任务不是 WhatsApp 渠道"}
+        if _find_customer_by_id(job["customer_id"]) is None:
+            return {"ok": False, "code": "customer_missing", "error": "客户不存在，不能继续联系；历史记录仍可查看"}
         url = build_whatsapp_link(f"+{job['recipient']}", "", job["body"])
         item = store.mark_opened(job_id)
         return {"ok": True, "url": url, "item": item}
@@ -2582,11 +2640,15 @@ def api_outreach_rebind_sender(job_id: int) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
+@_customer_locked
 def _execute_claimed_outreach_email(job_id: int) -> None:
     store = _outreach_store()
     try:
         job = store.get_job(job_id)
         if job["status"] != "sending":
+            return
+        if _find_customer_by_id(job["customer_id"]) is None:
+            store.complete_email_send(job_id, "failed", "customer_missing", "客户不存在，不能继续联系")
             return
         config = get_email_outreach_config()
         if (
@@ -2650,12 +2712,15 @@ def _execute_claimed_outreach_email(job_id: int) -> None:
 
 
 @app.post("/api/outreach/jobs/{job_id}/send-email")
+@_customer_locked
 def api_outreach_send_email(job_id: int) -> dict:
     try:
         store = _outreach_store()
         job = store.get_job(job_id)
         if job["channel"] != "email":
             return {"ok": False, "error": "该任务不是邮件渠道"}
+        if _find_customer_by_id(job["customer_id"]) is None:
+            return {"ok": False, "code": "customer_missing", "error": "客户不存在，不能继续联系；历史记录仍可查看"}
         config = get_email_outreach_config()
         if (
             job["provider"] != config["provider"]
@@ -2675,11 +2740,7 @@ def api_outreach_send_email(job_id: int) -> dict:
         if not CredentialStore().has(config["provider"], config["address"]):
             return {"ok": False, "error": "邮箱授权凭据尚未配置"}
         claimed = store.claim_email_send(job_id)
-        threading.Thread(
-            target=_execute_claimed_outreach_email,
-            args=(job_id,),
-            daemon=True,
-        ).start()
+        start_registered_worker(backup_coordinator, "smtp", _execute_claimed_outreach_email, (job_id,))
         return {"ok": True, "item": claimed}
     except (OutreachNotFound, OutreachConflict, CredentialUnavailable) as exc:
         return {"ok": False, "error": str(exc)}
@@ -2689,7 +2750,7 @@ def recover_outreach_after_startup() -> int:
     return _outreach_store().recover_interrupted()
 
 
-app.router.add_event_handler("startup", recover_outreach_after_startup)
+app.router.add_event_handler("startup", _owned_startup(recover_outreach_after_startup))
 
 
 # ---------- 客户名单内跟进（本地记录，不执行外联） ----------
@@ -2734,7 +2795,7 @@ def _startup_followup_cleanup() -> None:
         print("[Tradewind] 客户名单或跟进资料无法验证，已跳过跟进清理。")
 
 
-app.router.add_event_handler("startup", _startup_followup_cleanup)
+app.router.add_event_handler("startup", _owned_startup(_startup_followup_cleanup))
 
 
 @app.get("/api/customers/followup-summary")

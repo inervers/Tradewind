@@ -146,11 +146,11 @@ def main() -> int:
     print("=" * 58)
 
     # 必须在 TRADEWIND_DATA_DIR 设置后导入，确保业务模块使用用户数据目录。
-    import uvicorn
-    from server import app
-
-    threading.Thread(target=open_browser_when_ready, daemon=True).start()
     try:
+        import uvicorn
+        from server import app
+
+        threading.Thread(target=open_browser_when_ready, daemon=True).start()
         uvicorn.run(
             app,
             host=HOST,
@@ -160,8 +160,9 @@ def main() -> int:
         )
     except KeyboardInterrupt:
         pass
-    except Exception as exc:  # noqa: BLE001 - 双击启动时必须把错误留在窗口中
-        print(f"[Tradewind] 启动失败：{exc}")
+    except Exception:  # noqa: BLE001 - never disclose paths, data or credential errors
+        print("[Tradewind] 启动失败，无法安全确认本地服务或恢复状态。")
+        print("[Tradewind] 请保留本机资料与救援备份，联系维护人员；不要删除恢复材料。")
         input("按 Enter 键退出...")
         return 1
     return 0
