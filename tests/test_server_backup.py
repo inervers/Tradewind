@@ -148,6 +148,59 @@ class BackupAPITests(unittest.TestCase):
                 self.assertEqual(retry.json()["prepared"]["operation_id"], client.server.backup_coordinator.prepared_operation_id)
             self.assertEqual(len(client.get("/api/backup/state").json()["rescues"]), 1)
 
+    def assert_cancel_without_retry_consumes_preview(self, client, body, operation):
+        before = business_digest(self.layout)
+        state = client.get("/api/backup/state").json()
+        self.assertEqual(state["mode"], "prepared")
+        self.assertEqual(len(state["rescues"]), 1)
+        rescue = state["prepared"]["operation_id"]
+        # No intervening prepare retry: cancellation must reconcile durable success.
+        cancelled = client.post("/api/backup/restore/cancel", json={"operation_id": rescue})
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        reused = client.post("/api/backup/restore/prepare", json={**body, "request_id": "new-after-cancel"})
+        self.assertEqual(reused.status_code, 409, reused.text)
+        self.assertEqual(reused.json()["code"], "invalid_preview")
+        self.assertIsNone(client.get(f"/api/backup/operations/{body['preview_id']}").json()["preview"])
+        self.assertEqual(client.get(f"/api/backup/operations/{operation}").json()["status"], "cancelled")
+        state = client.get("/api/backup/state").json()
+        self.assertEqual((state["mode"], state["prepared"], len(state["rescues"])), ("ready", None, 1))
+        self.assertFalse(state["rescues"][0]["active"])
+        self.assertEqual(business_digest(self.layout), before)
+        # Failed scratch deletion must not keep the single preview slot occupied.
+        self.assertNotEqual(self.preview(client)["preview"]["id"], body["preview_id"])
+
+    def test_prepared_ack_failure_cancel_without_retry_consumes_preview(self):
+        self.require_feature()
+        from app.backup import service as service_module
+        original = service_module.prepare_restore
+        def lost_ack(*args, **kwargs):
+            original(*args, **kwargs)
+            raise BackupError("prepare_failed", "合成完成响应丢失")
+        with open_fixture_server(self.layout) as client:
+            view = self.preview(client)["preview"]
+            body = {"preview_id": view["id"], "epoch": view["epoch"], "request_id": "ack-cancel-no-retry"}
+            with patch.object(service_module, "prepare_restore", side_effect=lost_ack):
+                operation = client.post("/api/backup/restore/prepare", json=body).json()["id"]
+                self.assertEqual(self.wait(client, operation)["status"], "error")
+            self.assert_cancel_without_retry_consumes_preview(client, body, operation)
+
+    def test_prepared_cleanup_failure_cancel_without_retry_consumes_preview(self):
+        self.require_feature()
+        with open_fixture_server(self.layout) as client:
+            view = self.preview(client)["preview"]
+            body = {"preview_id": view["id"], "epoch": view["epoch"], "request_id": "cleanup-cancel-no-retry"}
+            service = client.server.backup_service
+            cleanup = service._cleanup
+            def fail_source_cleanup(item):
+                if item.view.id == view["id"]:
+                    raise BackupError("operation_failed", "合成源清理失败")
+                return cleanup(item)
+            with patch.object(service, "_cleanup", side_effect=fail_source_cleanup):
+                operation = client.post("/api/backup/restore/prepare", json=body).json()["id"]
+                self.assertEqual(self.wait(client, operation)["status"], "error")
+            self.assertTrue((self.layout.work_dir / view["id"]).exists())
+            self.assert_cancel_without_retry_consumes_preview(client, body, operation)
+
     def test_only_one_preview_ttl_and_cancel_release_material(self):
         self.require_feature()
         with open_fixture_server(self.layout) as client:

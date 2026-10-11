@@ -246,6 +246,26 @@ class BackupService:
                 self._cleanup(item)
                 item.view = replace(item.view, status="cancelled", preview=None)
 
+    def _reconcile_prepared(self, document):
+        if not document or document["state"] != "prepared":
+            return
+        binding = self._requests.get(document["request_id"])
+        if binding is None:
+            return  # Restarted services have no process-local source to consume.
+        bound_preview, _, operation = binding
+        item, source = self._operations[operation], self._operations[bound_preview]
+        if (source.validated is None or document["archive_sha256"] != source.validated.archive_sha256
+                or (item.view.prepared is not None
+                    and item.view.prepared.operation_id != document["operation_id"])):
+            raise _error("prepare_conflict")
+        # Durable publication consumes the token, regardless of acknowledgement
+        # or scratch deletion. This only reconciles process-local state.
+        prepared = PreparedRestore(document["operation_id"], document["operation_id"], "prepared")
+        item.view = replace(item.view, prepared=prepared)
+        source.view = replace(source.view, status="cancelled", preview=None)
+        if self._preview == bound_preview:
+            self._preview = None
+
     def prepare(self, preview_id: str, epoch: str, request_id: str) -> OperationView:
         with self._lock:
             self._feature()
@@ -260,19 +280,11 @@ class BackupService:
                     raise _error("prepare_conflict")
                 item = self._operations[operation]
                 if document and document["state"] == "prepared" and document["request_id"] == request_id:
-                    source = self._operations[bound_preview]
-                    if (source.validated is None or document["archive_sha256"] != source.validated.archive_sha256
-                            or (item.view.prepared is not None
-                                and item.view.prepared.operation_id != document["operation_id"])):
-                        raise _error("prepare_conflict")
                     # Publication is authoritative even when the worker's ack
                     # or subsequent scratch cleanup failed. Never reserve or
                     # prepare again; reconstruct only the safe existing view.
-                    prepared = PreparedRestore(document["operation_id"], document["operation_id"], "prepared")
-                    item.view = replace(item.view, status="done", phase="done", prepared=prepared, code="", message="")
-                    source.view = replace(source.view, status="cancelled", preview=None)
-                    if self._preview == bound_preview:
-                        self._preview = None
+                    self._reconcile_prepared(document)
+                    item.view = replace(item.view, status="done", phase="done", code="", message="")
                     return item.view
                 if item.view.status in {"running", "done"}:
                     return item.view
@@ -294,13 +306,16 @@ class BackupService:
                 raise _error() from None
             self._requests[request_id] = (preview_id, epoch, item.view.id)
             def prepare():
-                result = prepare_restore(self.layout, source.validated, preview, request_id=request_id,
-                    coordinator=self.coordinator, lease=lease, memory_path=self.memory_path, limits=self.limits,
-                    cancel=item.cancel.is_set, progress=self._progress(item))
+                try:
+                    result = prepare_restore(self.layout, source.validated, preview, request_id=request_id,
+                        coordinator=self.coordinator, lease=lease, memory_path=self.memory_path, limits=self.limits,
+                        cancel=item.cancel.is_set, progress=self._progress(item))
+                finally:
+                    with self._lock:
+                        self._reconcile_prepared(_read_recovery_state(self.layout))
                 with self._lock:
                     item.view = replace(item.view, prepared=result)
                     self._cleanup(source)
-                    source.view = replace(source.view, status="cancelled", preview=None)
                     self._cleanup(item)
             self._launch(item, prepare, lease)
             return item.view
@@ -314,6 +329,9 @@ class BackupService:
                 raise _error("not_found")
             if self._rescue_owners.get(operation_id) or self.coordinator.mode == "prepare":
                 raise _error("maintenance_busy")
+            document = _read_recovery_state(self.layout)
+            if document and document["operation_id"] == operation_id:
+                self._reconcile_prepared(document)
             cancel_prepared_restore(self.layout, operation_id, self.coordinator)
             for key, (_, _, id) in list(self._requests.items()):
                 item = self._operations[id]
