@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { api } from "../api";
 import ConfirmDialog from "../components/ConfirmDialog";
 import CustomerFollowupPanel from "../components/CustomerFollowupPanel";
@@ -17,9 +17,11 @@ interface Props {
   onStartOutreach: (seed: ComposeSeed) => void;
   onFollowupDirtyChange?: (dirty: boolean) => void;
   onFollowupBusyChange?: (busy: boolean) => void;
+  maintenanceControls?: ReactNode;
+  onFollowupOpenChange?: (open: boolean) => void;
 }
 
-export default function CustomersTab({ onStartOutreach, onFollowupDirtyChange, onFollowupBusyChange }: Props) {
+export default function CustomersTab({ onStartOutreach, onFollowupDirtyChange, onFollowupBusyChange, maintenanceControls, onFollowupOpenChange }: Props) {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [showAdd, setShowAdd] = useState(false);
   const [showImport, setShowImport] = useState(false);
@@ -551,7 +553,7 @@ export default function CustomersTab({ onStartOutreach, onFollowupDirtyChange, o
           </>
         )}
       </div>
-      {followupCustomer && <CustomerFollowupPanel key={followupCustomer.id} customer={customers.find(c => c.id === followupCustomer.id) || followupCustomer} missing={!customers.some(c => c.id === followupCustomer.id)} onClose={() => setFollowupCustomer(null)} onChanged={changed} onDirtyChange={dirtyChanged} onBusyChange={busyChanged} />}
+      {followupCustomer && <CustomerFollowupPanel key={followupCustomer.id} customer={customers.find(c => c.id === followupCustomer.id) || followupCustomer} missing={!customers.some(c => c.id === followupCustomer.id)} onClose={() => setFollowupCustomer(null)} onChanged={changed} onDirtyChange={dirtyChanged} onBusyChange={busyChanged} maintenanceControls={maintenanceControls} onOpenChange={onFollowupOpenChange} />}
       {pendingFollowup && <ConfirmDialog title="切换客户并放弃未保存的跟进内容？" confirmText="放弃并切换" onCancel={() => setPendingFollowup(null)} onConfirm={() => { setFollowupCustomer(pendingFollowup); setPendingFollowup(null); }} />}
       {del && (
         <ConfirmDialog

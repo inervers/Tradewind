@@ -17,6 +17,7 @@ import SettingsTab from "./tabs/SettingsTab";
 import OutreachTab from "./tabs/OutreachTab";
 import type { ComposeSeed, DataSafetyState } from "./types";
 import DataMaintenanceNotice from "./components/DataMaintenanceNotice";
+import BackupSettingsCard from "./components/BackupSettingsCard";
 import { getDataSafetyState, getPageEpoch, initializeDataEpoch, subscribeDataSafety } from "./dataEpoch";
 import { resetTaskReferencesForEpoch } from "./tasks";
 
@@ -141,6 +142,7 @@ export default function App() {
   const [composeSeed, setComposeSeed] = useState<ComposeSeed | null>(null);
   const [followupDirty, setFollowupDirty] = useState(false);
   const [followupBusy, setFollowupBusy] = useState(false);
+  const [followupOpen, setFollowupOpen] = useState(false);
   const [pendingNavigation, setPendingNavigation] = useState<{ tab: TabKey; seed?: ComposeSeed } | null>(null);
   const checkingGeneration = useRef(new WeakSet<HTMLButtonElement>());
   const checkedGeneration = useRef(new WeakSet<HTMLButtonElement>());
@@ -212,6 +214,8 @@ export default function App() {
   const guardBusinessAction = (event: SyntheticEvent) => {
     const state = getDataSafetyState();
     const target = event.target as HTMLElement;
+    // Controls have their own frozen-epoch API and server-side maintenance gates.
+    if (target.closest("[data-backup-controls]")) return;
     const button = target.closest("button");
     if (event.type === "click" && !button) return;
     if (state.mode !== "ready") {
@@ -265,7 +269,7 @@ export default function App() {
         <AuroraBackground />
         <div className="card setup-card">
           <BrandMark />
-          <DataMaintenanceNotice state={dataSafety} />
+          <DataMaintenanceNotice state={dataSafety} controls={<BackupSettingsCard />} />
           <h1 className="page-title" style={{ fontSize: 20, marginBottom: 6 }}>
             首次使用
           </h1>
@@ -320,7 +324,7 @@ export default function App() {
       </aside>
       <main className="main">
         <TradeRoutes />
-        <DataMaintenanceNotice state={dataSafety} />
+        {!followupOpen && <DataMaintenanceNotice state={dataSafety} controls={!bootRestricted && tab === "settings" ? <p>请使用下方业务备份卡中的恢复控制。已有表单仍可复制。</p> : <BackupSettingsCard />} />}
         {bootRestricted && error && <p role="alert">{error}</p>}
         {!bootRestricted && <div onClickCapture={guardBusinessAction} onSubmitCapture={guardBusinessAction}>
         <FadeIn key={tab}>
@@ -332,7 +336,7 @@ export default function App() {
             />
           )}
           {tab === "batch" && <BatchTab />}
-          {tab === "customers" && <CustomersTab onStartOutreach={startOutreach} onFollowupDirtyChange={setFollowupDirty} onFollowupBusyChange={setFollowupBusy} />}
+          {tab === "customers" && <CustomersTab onStartOutreach={startOutreach} onFollowupDirtyChange={setFollowupDirty} onFollowupBusyChange={setFollowupBusy} onFollowupOpenChange={setFollowupOpen} maintenanceControls={<DataMaintenanceNotice state={dataSafety} controls={<BackupSettingsCard />} />} />}
           {tab === "outreach" && <OutreachTab />}
           {tab === "crawler" && <CrawlerTab />}
           {tab === "photos" && <PhotosTab />}

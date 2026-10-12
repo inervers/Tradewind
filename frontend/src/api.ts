@@ -3,7 +3,7 @@ import type {
   ConfigState, CrawlerState, CrawlerTarget, Customer, EmailOutreachSettings, EmailResult,
   ExtractTask, HistoryItem, Lang, OutFormat, OutreachChannel, OutreachJob,
   OutreachStatus, OutreachSuppression, PhotoLibraryStore, PhotoTaskState, Product,
-  TaskState, Template, BackupState,
+  TaskState, Template, BackupState, OperationView,
   FollowupChannel, FollowupOutcome, FollowupRecord, FollowupPlan, FollowupSummary, FollowupTimelinePage,
 } from "./types";
 import { getDataSafetyState, getPageEpoch, initializeDataEpoch, markDataMaintenance, markDataStale, refreshDataSafety } from "./dataEpoch";
@@ -36,7 +36,7 @@ async function req<T>(url: string, opts?: RequestInit): Promise<T> {
       if (resp.status === 409 && j.code === "stale_epoch") markDataStale();
       if (resp.status === 503 && j.code === "maintenance_busy") markDataMaintenance();
     } catch { /* ignore */ }
-    throw new Error(detail || `请求失败（${resp.status}）`);
+    throw new Error(control ? "备份操作未确认成功，请刷新状态或重试。" : detail || `请求失败（${resp.status}）`);
   }
   const result = await resp.json() as T;
   // In-flight task/list reads can finish after restart. Never deliver not_found
@@ -83,9 +83,56 @@ async function postEmail<T>(url: string, body: unknown, signal?: AbortSignal): P
   return post<T>(url, body, signal);
 }
 
+/** Native navigation keeps large ZIPs out of renderer memory. */
+export function backupDownloadUrl(id: string, rescue: boolean): string {
+  return apiUrl(`/api/backup/${rescue ? "rescues" : "operations"}/${encodeURIComponent(id)}/download`);
+}
+
+/** Raw File body, never FormData; progress represents actual uploaded bytes. */
+async function uploadBackupFile(file: File, signal: AbortSignal, progress?: (loaded: number, total: number) => void): Promise<OperationView> {
+  await initializeDataEpoch();
+  if (signal.aborted) throw new DOMException("上传已取消", "AbortError");
+  if (getDataSafetyState().mode === "stale") throw new Error("页面数据版本已变化，请先复制草稿再重新打开。");
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const cleanup = () => signal.removeEventListener("abort", abort);
+    const fail = () => { cleanup(); reject(new Error("备份上传未确认成功，请刷新状态或重新选择文件。")); };
+    const abort = () => xhr.abort();
+    xhr.open("POST", apiUrl("/api/backup/preview"));
+    xhr.setRequestHeader("Content-Type", "application/zip");
+    xhr.setRequestHeader("X-Tradewind-Data-Epoch", getPageEpoch()!);
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable && event.total === file.size) progress?.(Math.max(0, Math.min(event.loaded, file.size)), file.size);
+    };
+    xhr.onerror = fail;
+    xhr.onabort = () => { cleanup(); reject(new DOMException("上传已取消", "AbortError")); };
+    xhr.onload = () => {
+      cleanup();
+      let payload;
+      try { payload = JSON.parse(xhr.responseText); } catch { fail(); return; }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        if (payload.code === "stale_epoch") markDataStale();
+        if (payload.code === "maintenance_busy") markDataMaintenance();
+        fail(); return;
+      }
+      resolve(payload as OperationView);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    xhr.send(file);
+  });
+}
+
 export const api = {
   backup: {
     state: (): Promise<BackupState> => refreshDataSafety(),
+    getState: (): Promise<BackupState> => refreshDataSafety(),
+    startExport: (includesPhotos: boolean) => post<OperationView>("/api/backup/export", { includes_photos: includesPhotos }),
+    getOperation: (id: string) => req<OperationView>(`/api/backup/operations/${encodeURIComponent(id)}`, { cache: "no-store" }),
+    cancelOperation: (id: string) => post<{ ok: true }>(`/api/backup/operations/${encodeURIComponent(id)}/cancel`, {}),
+    startPreview: uploadBackupFile,
+    prepareRestore: (previewId: string, epoch: string, requestId: string) => post<OperationView>("/api/backup/restore/prepare", { preview_id: previewId, epoch, request_id: requestId }),
+    cancelRestore: (operationId: string) => post<{ ok: true }>("/api/backup/restore/cancel", { operation_id: operationId }),
+    deleteRescue: (id: string) => req<{ ok: true }>(`/api/backup/rescues/${encodeURIComponent(id)}`, { method: "DELETE" }),
   },
   getConfig: () => req<ConfigState>("/api/config"),
   saveKey: (provider: string, apiKey: string) =>

@@ -47,6 +47,33 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* Backup controls reuse the established paper/ink theme, without other-tab changes. */
+.backup-settings-card { margin-top: 16px; min-width: 0; overflow-wrap: anywhere; }
+.backup-settings-card p, .backup-confirm-content p { color: var(--ink-2); line-height: 1.65; margin: 8px 0; font-size: 14px; }
+.backup-settings-card .backup-warning { color: var(--red); font-weight: 600; }
+.backup-settings-card h3 { font-family: var(--font-serif); color: var(--navy); font-size: 17px; margin: 20px 0 10px; }
+.backup-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.backup-settings-card .btn, .backup-settings-card .input, .backup-confirm-content .input { min-height: 44px; min-width: 44px; max-width: 100%; white-space: normal; }
+.backup-settings-card a.btn { text-decoration: none; }
+.backup-photo-option { display: flex; gap: 10px; align-items: center; min-height: 44px; width: fit-content; cursor: pointer; }
+.backup-photo-option input { width: 20px; height: 20px; accent-color: var(--amber); }
+.backup-file-label, .backup-confirm-content label { display: grid; gap: 8px; margin: 12px 0; }
+.backup-file-label input { width: 100%; font-size: 14px; padding: 8px; }
+.backup-file-label input::file-selector-button { min-height: 44px; padding: 8px 12px; color: var(--ink); border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--surface); }
+.backup-settings-card progress { display: block; width: 100%; accent-color: var(--navy); margin: 10px 0; }
+.backup-preview table { border-collapse: collapse; width: 100%; font-size: 14px; }
+.backup-preview th, .backup-preview td { padding: 8px 4px; border-bottom: 1px solid var(--line); text-align: left; }
+.backup-preview th { font-weight: 500; color: var(--ink-2); }
+.backup-prepared { border-left: 3px solid var(--navy); padding: 0 12px; background: var(--navy-tint); }
+.backup-rescue { border-top: 1px solid var(--line); padding: 8px 0; }
+.backup-settings-card .backup-error { color: var(--red); border: 1px solid var(--red); padding: 10px; border-radius: var(--r-sm); }
+.backup-settings-card :focus-visible, .confirm-card :focus-visible { outline: 2px solid var(--navy); outline-offset: 3px; }
+.backup-confirm-content .input { font-size: 16px; }
+@media (max-width: 540px) {
+  .backup-settings-card .card-title { flex-wrap: wrap; gap: 8px; }
+  .backup-preview th, .backup-preview td { font-size: 13px; }
+}
+
 /* 客户跟进沿用纸底、墨色和航海蓝；独立于仪器备注。 */
 .followup-filters { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }
 .followup-filters .btn { min-height: 44px; gap: 10px; }

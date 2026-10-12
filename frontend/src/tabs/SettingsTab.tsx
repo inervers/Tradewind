@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import ConfirmDialog from "../components/ConfirmDialog";
+import BackupSettingsCard from "../components/BackupSettingsCard";
 import { FadeIn, useToast } from "../components/effects";
 import { DownloadIcon, GearIcon, KeyIcon } from "../components/Icons";
 import { SelectCombo, VisionModelCombo } from "../components/Combo";
@@ -719,6 +720,8 @@ export default function SettingsTab() {
           <span className="field-hint">不包含 Key、客户资料、邮件正文、搜索词、网址、照片、文件路径或原始日志。</span>
         </div>
       </div>
+
+      <BackupSettingsCard />
 
       <div className="card" style={{ marginTop: 16 }}>
         <div className="card-title"><span>关于</span></div>

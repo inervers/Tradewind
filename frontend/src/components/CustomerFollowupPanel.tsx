@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
 import { acquireBodyScrollLock } from "../scrollLock";
@@ -11,11 +11,13 @@ interface Props {
   customer: Customer; onClose: () => void; onChanged: () => void;
   onDirtyChange: (dirty: boolean) => void; onBusyChange?: (busy: boolean) => void;
   missing?: boolean;
+  maintenanceControls?: ReactNode;
+  onOpenChange?: (open: boolean) => void;
 }
 const emptyRecord = () => ({ contacted_at: localDateTime(), channel: "phone" as FollowupChannel, outcome: "awaiting_reply" as FollowupOutcome, content: "" });
 const errorText = (error: unknown) => error instanceof Error ? error.message : "请求失败，请重试";
 
-export default function CustomerFollowupPanel({ customer, onClose, onChanged, onDirtyChange, onBusyChange, missing = false }: Props) {
+export default function CustomerFollowupPanel({ customer, onClose, onChanged, onDirtyChange, onBusyChange, missing = false, maintenanceControls, onOpenChange }: Props) {
   const [record, setRecord] = useState(emptyRecord);
   const [recordBaseline, setRecordBaseline] = useState(() => JSON.stringify(record));
   const [plan, setPlan] = useState<FollowupPlan | null>(null);
@@ -43,6 +45,11 @@ export default function CustomerFollowupPanel({ customer, onClose, onChanged, on
   const dirty = JSON.stringify(record) !== recordBaseline || planDirty;
   const callbacks = useRef({ onClose, onChanged, onDirtyChange, onBusyChange, dirty, busy, loading });
   callbacks.current = { onClose, onChanged, onDirtyChange, onBusyChange, dirty, busy, loading };
+
+  useEffect(() => {
+    onOpenChange?.(true);
+    return () => onOpenChange?.(false);
+  }, [onOpenChange]);
 
   useEffect(() => {
     onDirtyChange(dirty);
@@ -199,6 +206,7 @@ export default function CustomerFollowupPanel({ customer, onClose, onChanged, on
         <button className="icon-btn" aria-label="关闭客户跟进" onClick={close} disabled={busy}><XIcon size={18} /></button>
       </header>
       <div className="followup-scroll">
+        <div data-backup-controls>{maintenanceControls}</div>
         <p className="followup-hint">记录实际沟通，安排下一步。不会自动发信，也不会改变客户原有的已发 / 已回复状态。</p>
         {missing && <p className="followup-error" role="alert">客户已从名单中删除，无法再保存跟进。未保存的输入仍保留在此，请先复制需要的内容再关闭。</p>}
         {loading && <p role="status">正在读取跟进记录…</p>}
