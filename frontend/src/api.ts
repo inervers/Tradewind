@@ -10,6 +10,13 @@ import { getDataSafetyState, getPageEpoch, initializeDataEpoch, markDataMaintena
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
+/** Preserve only a definite safe control code, never server exception text. */
+export class BackupRequestError extends Error {
+  constructor(readonly code: "invalid_preview" | null = null) {
+    super("备份操作未确认成功，请刷新状态或重试。");
+  }
+}
+
 /** 浏览器版沿用同源 /api；桌面版指向本机 FastAPI 服务。 */
 export function apiUrl(url: string): string {
   if (!url || /^(?:[a-z]+:)?\/\//i.test(url) || url.startsWith("data:") || url.startsWith("blob:")) {
@@ -30,13 +37,16 @@ async function req<T>(url: string, opts?: RequestInit): Promise<T> {
   const resp = await fetch(apiUrl(url), { ...opts, headers: mergedHeaders });
   if (!resp.ok) {
     let detail = "";
+    let backupCode: "invalid_preview" | null = null;
     try {
       const j = await resp.json();
       detail = j.detail || j.error || "";
       if (resp.status === 409 && j.code === "stale_epoch") markDataStale();
       if (resp.status === 503 && j.code === "maintenance_busy") markDataMaintenance();
+      if (control && resp.status === 409 && j.code === "invalid_preview") backupCode = "invalid_preview";
     } catch { /* ignore */ }
-    throw new Error(control ? "备份操作未确认成功，请刷新状态或重试。" : detail || `请求失败（${resp.status}）`);
+    if (control) throw new BackupRequestError(backupCode);
+    throw new Error(detail || `请求失败（${resp.status}）`);
   }
   const result = await resp.json() as T;
   // In-flight task/list reads can finish after restart. Never deliver not_found
@@ -86,6 +96,16 @@ async function postEmail<T>(url: string, body: unknown, signal?: AbortSignal): P
 /** Native navigation keeps large ZIPs out of renderer memory. */
 export function backupDownloadUrl(id: string, rescue: boolean): string {
   return apiUrl(`/api/backup/${rescue ? "rescues" : "operations"}/${encodeURIComponent(id)}/download`);
+}
+
+/** Header-only reachability check on the existing GET route, not a transfer.
+ * Cancel the body immediately; never consume the ZIP or equate 200 with success.
+ */
+export async function checkBackupDownload(id: string, rescue: boolean): Promise<void> {
+  const response = await fetch(backupDownloadUrl(id, rescue), { cache: "no-store" });
+  const valid = response.ok && response.headers.get("Content-Type")?.split(";", 1)[0] === "application/zip";
+  await response.body?.cancel();
+  if (!valid) throw new Error("下载地址检查失败，请重试。");
 }
 
 /** Raw File body, never FormData; progress represents actual uploaded bytes. */

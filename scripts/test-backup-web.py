@@ -103,7 +103,7 @@ for (const name of ['api', 'tasks', 'types', 'dataEpoch']) {
                 if path == "/api/backup/state":
                     state["state_reads"] += 1
                     return self.reply({"mode": state["mode"], "epoch": state["epoch"], "require_header": state["require_header"],
-                                       "revision": 0, "prepared": {"operation_id": "synthetic-op", "rescue_id": "synthetic-rescue", "status": "prepared"} if state["mode"] == "prepared" else None,
+                                       "revision": state.get("revision", 0), "prepared": {"operation_id": "synthetic-op", "rescue_id": "synthetic-rescue", "status": "prepared"} if state["mode"] == "prepared" else None,
                                        "rescues": state["rescues"], "report": {"status": "none", "operation_id": "", "code": "", "counts": COUNTS}, "estimated_bytes": 0, "photo_count": 0})
                 if self.command != "GET":
                     state["mutations"].append(request)
@@ -111,12 +111,16 @@ for (const name of ['api', 'tasks', 'types', 'dataEpoch']) {
                         return self.reply({"code": "stale_epoch", "detail": "数据版本已变化，请重新打开页面。"}, 409)
                 if path.startswith("/api/backup/"):
                     if path.endswith("/download"):
+                        abort_native = state.get("abort_native_download") and self.headers.get("Sec-Fetch-Mode") == "navigate"
                         self.send_response(200)
                         self.send_header("Content-Type", "application/zip")
                         self.send_header("Content-Disposition", 'attachment; filename="synthetic.zip"')
-                        self.send_header("Content-Length", str(len(stream.getvalue())))
+                        self.send_header("Content-Length", str(len(stream.getvalue()) + (1024 if abort_native else 0)))
                         self.end_headers()
-                        self.wfile.write(stream.getvalue())
+                        try:
+                            self.wfile.write(stream.getvalue())
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                            pass
                         return
                     if path == "/api/backup/export":
                         state["operations"]["export-op"] = operation("export-op", "export")
@@ -125,12 +129,15 @@ for (const name of ['api', 'tasks', 'types', 'dataEpoch']) {
                         state["upload_bytes"] = len(body)
                         if state.get("upload_gate") is not None:
                             state["upload_gate"].wait(timeout=10)
-                        preview = {"id": "preview-id", "archive_sha256": "a" * 64, "epoch": OLD, "revision": 0,
+                        preview = {"id": "preview-id", "archive_sha256": "a" * 64, "epoch": OLD, "revision": state.get("revision", 0),
                                    "expires_at": 9999999999, "backup": summary, "current": {**summary, "counts": {**COUNTS, "customers": 1}}}
                         state["operations"]["preview-op"] = operation("preview-op", "preview", preview=preview)
                         return self.reply(state["operations"]["preview-op"])
                     if path == "/api/backup/restore/prepare":
                         payload = json.loads(body)
+                        preview_revision = state["operations"].get("preview-op", {}).get("preview", {}).get("revision", 0)
+                        if state.get("expired_preview") or preview_revision != state.get("revision", 0):
+                            return self.reply({"code": "invalid_preview", "detail": "private/path/key/stack"}, 409)
                         state["prepare_ids"].setdefault(payload["request_id"], "synthetic-op")
                         state["rescues"] = [{"id": "synthetic-rescue", "created_at": "2026-10-12T00:00:00Z", "size_bytes": 128, "active": True}]
                         state["mode"] = "prepared"
@@ -877,6 +884,126 @@ class UITests(SafetyTests):
         self.expect(self.card.get_by_role("button", name="取消恢复", exact=True)).to_have_count(0)
         self.assertEqual(self.state["mode"], "ready")
         self.assertTrue(all(r["epoch"] == OLD for r in self.state["mutations"]))
+
+    def test_rejected_native_download_has_safe_failure_retry_and_preserves_draft_and_lock(self):
+        self.state["rescues"] = [{"id": "completed", "created_at": "2026-10-12", "size_bytes": 128, "active": False}]
+        self.settings()
+        draft = self.page.get_by_placeholder("Demo User", exact=True)
+        draft.fill("合成未保存签名")
+        self.page.evaluate("() => { Response.prototype.blob = () => { throw new Error('business blob forbidden'); }; }")
+        url = "**/api/backup/rescues/completed/download"
+        def rejected(route):
+            route.fulfill(status=404, json={"code": "not_found", "detail": "private/path/key/stack"})
+        self.page.route(url, rejected)
+        self.card.get_by_role("link", name="下载救援备份", exact=True).click()
+        self.expect(self.card.get_by_role("alert")).to_contain_text("下载")
+        self.expect(self.card).not_to_contain_text("private/path/key/stack")
+        self.expect(draft).to_have_value("合成未保存签名")
+        self.assertEqual(self.page.url.rstrip("/"), self.base)
+        delete = self.card.get_by_role("button", name="删除整组救援备份", exact=True)
+        self.expect(delete).to_be_disabled()
+        retry = self.card.get_by_role("link", name="重试下载", exact=True)
+        self.expect(retry).to_be_visible()
+        self.page.unroute(url, rejected)
+        with self.page.expect_download() as event:
+            retry.click()
+        with zipfile.ZipFile(event.value.path()) as archive:
+            self.assertEqual(archive.namelist()[0], "manifest.json")
+        self.expect(delete).to_be_disabled()
+        self.expect(self.card).not_to_contain_text("下载已完成")
+        self.card.get_by_role("button", name="我已核实浏览器下载结束", exact=True).click()
+        self.expect(delete).to_be_enabled()
+        self.assertEqual(len(self.state["rescues"]), 1)
+
+    def test_aborted_native_download_user_report_retries_without_blob_or_automatic_unlock(self):
+        self.state["abort_native_download"] = True
+        self.state["rescues"] = [{"id": "completed", "created_at": "2026-10-12", "size_bytes": 128, "active": False}]
+        self.settings()
+        draft = self.page.get_by_placeholder("Demo User", exact=True)
+        draft.fill("下载取消仍保留")
+        self.page.evaluate("() => { Response.prototype.blob = () => { throw new Error('business blob forbidden'); }; }")
+        with self.page.expect_download() as event:
+            self.card.get_by_role("link", name="下载救援备份", exact=True).click()
+        self.assertIsNotNone(event.value.failure())
+        report = self.card.get_by_role("button", name="报告下载失败或取消", exact=True)
+        self.expect(report).to_be_enabled()
+        report.click()
+        self.expect(self.card.get_by_role("alert")).to_contain_text("下载")
+        self.expect(draft).to_have_value("下载取消仍保留")
+        self.assertEqual(self.page.url.rstrip("/"), self.base)
+        self.expect(self.card.get_by_role("button", name="删除整组救援备份", exact=True)).to_be_disabled()
+        self.state["abort_native_download"] = False
+        with self.page.expect_download() as retry_event:
+            self.card.get_by_role("link", name="重试下载", exact=True).click()
+        self.assertIsNone(retry_event.value.failure())
+        self.expect(self.card).not_to_contain_text("下载已完成")
+        self.expect(self.card.get_by_role("button", name="删除整组救援备份", exact=True)).to_be_disabled()
+
+    def invalid_preview_escape(self, reason):
+        self.preview()
+        draft = self.page.get_by_placeholder("Demo User", exact=True)
+        draft.fill("失效预览仍保留草稿")
+        if reason == "expiry":
+            self.state["expired_preview"] = True
+        else:
+            self.state["revision"] = 1
+        self.page.get_by_role("button", name="准备恢复", exact=True).click()
+        self.page.get_by_label("确认词", exact=True).fill("恢复")
+        self.page.get_by_role("button", name="确认恢复", exact=True).click()
+        self.expect(self.card.get_by_role("alert")).to_contain_text("预览已失效")
+        self.expect(self.card.get_by_role("button", name="导出业务备份", exact=True)).to_be_enabled()
+        upload = self.page.get_by_label("选择业务备份 ZIP", exact=True)
+        self.expect(upload).to_be_enabled()
+        self.expect(self.card.get_by_role("button", name="重试准备恢复", exact=True)).to_have_count(0)
+        self.expect(draft).to_have_value("失效预览仍保留草稿")
+        self.assertEqual(self.state["rescues"], [])
+        self.state["expired_preview"] = False
+        upload.set_input_files({"name": "replacement.zip", "mimeType": "application/zip", "buffer": b"replacement-synthetic"})
+        self.expect(self.card.get_by_role("button", name="准备恢复", exact=True)).to_be_enabled()
+        self.card.get_by_role("button", name="准备恢复", exact=True).click()
+        self.page.get_by_label("确认词", exact=True).fill("恢复")
+        self.page.get_by_role("button", name="确认恢复", exact=True).click()
+        self.expect(self.card.get_by_role("button", name="取消恢复", exact=True)).to_be_enabled()
+        prepares = [json.loads(r["body"]) for r in self.state["requests"] if r["path"] == "/api/backup/restore/prepare"]
+        self.assertEqual(len(prepares), 2)
+        self.assertNotEqual(prepares[0]["request_id"], prepares[1]["request_id"])
+        self.assertEqual(len(self.state["rescues"]), 1)
+        self.expect(draft).to_have_value("失效预览仍保留草稿")
+
+    def test_expired_preview_rejection_unlocks_repreview_export_without_reload(self):
+        self.invalid_preview_escape("expiry")
+
+    def test_revision_preview_rejection_unlocks_repreview_export_without_reload(self):
+        self.invalid_preview_escape("revision")
+
+    def test_uncertain_prepare_and_unknown_code_ready_state_keep_exact_request(self):
+        for error in ("network", "unknown"):
+            with self.subTest(error=error):
+                self.preview()
+                calls = []
+                def uncertain(route):
+                    calls.append(route.request.post_data_json)
+                    if len(calls) > 1:
+                        route.continue_()
+                    elif error == "network":
+                        route.abort()
+                    else:
+                        route.fulfill(status=409, json={"code": "invalid_preview_extra", "detail": "private/path/key/stack"})
+                self.page.route("**/api/backup/restore/prepare", uncertain)
+                self.page.get_by_role("button", name="准备恢复", exact=True).click()
+                self.page.get_by_label("确认词", exact=True).fill("恢复")
+                self.page.get_by_role("button", name="确认恢复", exact=True).click()
+                self.expect(self.card.get_by_role("alert")).to_be_visible()
+                self.card.get_by_role("button", name="刷新备份状态", exact=True).click()
+                self.expect(self.card.get_by_role("button", name="导出业务备份", exact=True)).to_be_disabled()
+                retry = self.card.get_by_role("button", name="重试准备恢复", exact=True)
+                self.expect(retry).to_be_enabled()
+                retry.click()
+                self.expect(self.card.get_by_role("button", name="取消恢复", exact=True)).to_be_enabled()
+                self.assertEqual(calls[0], calls[1])
+                self.card.get_by_role("button", name="取消恢复", exact=True).click()
+                self.expect(self.card.get_by_role("button", name="导出业务备份", exact=True)).to_be_enabled()
+                self.page.unroute("**/api/backup/restore/prepare", uncertain)
 
 
 if __name__ == "__main__":

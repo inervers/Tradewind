@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, backupDownloadUrl } from "../api";
+import { api, backupDownloadUrl, BackupRequestError, checkBackupDownload } from "../api";
 import { getDataSafetyState, subscribeDataSafety } from "../dataEpoch";
 import type { BackupCounts, BackupState, OperationView, RestorePreview } from "../types";
 import ConfirmDialog from "./ConfirmDialog";
@@ -8,11 +8,12 @@ import ConfirmDialog from "./ConfirmDialog";
 // must not. Never put ephemeral operation IDs in localStorage or bootstrap state.
 const session: {
   state: BackupState | null; operation: OperationView | null; preview: RestorePreview | null;
-  pending: { previewId: string; epoch: string; requestId: string } | null;
+  pending: { previewId: string; epoch: string; requestId: string; rejected?: boolean } | null;
   upload: AbortController | null; uploaded: number; uploadTotal: number;
-  busy: boolean; error: string; notice: string; downloads: Set<string>;
+  busy: boolean; error: string; notice: string;
+  downloads: Map<string, { rescue: boolean; checking: boolean; failed: boolean }>;
 } = { state: null, operation: null, preview: null, pending: null, upload: null,
-  uploaded: 0, uploadTotal: 0, busy: false, error: "", notice: "", downloads: new Set() };
+  uploaded: 0, uploadTotal: 0, busy: false, error: "", notice: "", downloads: new Map() };
 const listeners = new Set<() => void>();
 const publish = () => listeners.forEach(listener => listener());
 const safeError = "操作未确认成功。请刷新状态或重试；救援备份不会自动删除。";
@@ -26,6 +27,14 @@ async function refresh(): Promise<void> {
     session.pending = null; session.preview = null;
     if (session.operation?.kind === "prepare") session.operation = null;
     session.notice = "已确认恢复准备解除，继续使用当前资料；救援备份仍保留。";
+  }
+  // A ready observation alone never retires an uncertain acknowledgement.
+  // Require the definite whitelisted pre-admission rejection AND live authority.
+  if (session.pending?.rejected && next.mode === "ready" && !next.prepared
+      && next.epoch === session.pending.epoch && !session.operation?.prepared
+      && !(session.operation?.kind === "prepare" && session.operation.status === "running")) {
+    session.pending = null; session.preview = null; session.operation = null;
+    session.error = "预览已失效，恢复未准备。请重新选择 ZIP 进行预览，或导出当前业务备份；已有草稿仍保留。";
   }
   session.state = next;
   publish();
@@ -65,10 +74,35 @@ async function prepare(): Promise<void> {
   if (!pending) return;
   await act(async () => {
     // On a lost acknowledgement, never create a new request or new rescue.
-    const operation = await api.backup.prepareRestore(pending.previewId, pending.epoch, pending.requestId);
-    track(operation);
-    await refresh();
+    try {
+      const operation = await api.backup.prepareRestore(pending.previewId, pending.epoch, pending.requestId);
+      track(operation);
+      await refresh();
+    } catch (error) {
+      if (error instanceof BackupRequestError && error.code === "invalid_preview" && session.pending === pending) {
+        pending.rejected = true;
+        await refresh();
+        if (session.pending !== pending) return;
+      }
+      throw error;
+    }
   });
+}
+
+async function download(id: string, rescue: boolean): Promise<void> {
+  if (session.downloads.get(id)?.checking) return;
+  const attempt = { rescue, checking: true, failed: false };
+  session.downloads.set(id, attempt); publish();
+  try {
+    await checkBackupDownload(id, rescue);
+    // Keep native browser URL ownership; no Blob/fetched ZIP body/navigation of
+    // the draft page. A successful address check is not completed transfer.
+    const anchor = document.createElement("a");
+    anchor.href = backupDownloadUrl(id, rescue); anchor.download = "";
+    anchor.target = "_blank"; anchor.rel = "noopener"; anchor.click();
+    session.notice = "已发起下载，请在浏览器下载列表确认成功或失败。地址检查通过不代表下载完成；下载中不能删除材料。";
+  } catch { attempt.failed = true; }
+  finally { attempt.checking = false; publish(); }
 }
 
 const labels: Record<keyof BackupCounts, string> = {
@@ -116,12 +150,6 @@ export default function BackupSettingsCard(): JSX.Element {
     }).finally(() => { session.upload = null; publish(); void refresh().catch(() => {}); });
   };
 
-  const download = (id: string) => {
-    session.downloads.add(id);
-    session.notice = "已发起下载，请在浏览器下载列表确认成功或失败。此页面无法确认下载完成；下载中不能删除材料。";
-    publish();
-  };
-
   return <section className="card backup-settings-card" data-backup-controls aria-label="业务备份与恢复">
     <div className="card-title"><span>业务备份与恢复</span><span className="badge badge-neutral">仅在本机处理</span></div>
     <p className="backup-warning">业务备份含客户资料，是未加密的私密 ZIP，请勿公开分享。</p>
@@ -131,6 +159,18 @@ export default function BackupSettingsCard(): JSX.Element {
     {state?.report.status === "rolled_back" && <p role="status">恢复未完成，程序已回滚。请保留救援备份并检查资料。</p>}
     {error && <p className="backup-error" role="alert">{error}</p>}
     {notice && <p role="status">{notice}</p>}
+    {Array.from(session.downloads, ([id, attempt]) => <div key={id}>
+      {attempt.checking ? <p role="status">正在检查下载地址，不代表下载完成…</p>
+        : attempt.failed ? <p className="backup-error" role="alert">下载检查失败或你已报告下载失败／取消。请重试下载；本页删除保护仍保留，先核实浏览器传输已结束。</p>
+          : <p role="status">本次下载由浏览器处理；页面无法确认传输是否完成。若浏览器显示失败或取消，请在此报告并重试。</p>}
+      <div className="backup-actions">
+        {attempt.failed && <a className="btn btn-ghost" href={backupDownloadUrl(id, attempt.rescue)} download target="_blank" rel="noopener" onClick={event => { event.preventDefault(); void download(id, attempt.rescue); }}>重试下载</a>}
+        <button className="btn btn-ghost" disabled={attempt.checking} onClick={() => { attempt.failed = true; publish(); }}>报告下载失败或取消</button>
+        <button className="btn btn-ghost" disabled={attempt.checking} onClick={() => {
+          session.downloads.delete(id); session.notice = "已按你的确认解除本页下载保护，服务端仍会拒绝删除正在下载的材料。"; publish();
+        }}>我已核实浏览器下载结束</button>
+      </div>
+    </div>)}
     <div className="backup-actions">
       <button className="btn btn-ghost" disabled={busy} onClick={() => void act(refresh)}>刷新备份状态</button>
     </div>
@@ -141,7 +181,7 @@ export default function BackupSettingsCard(): JSX.Element {
       <p>照片数量尚未测量；缓存参考值可能过时（{state && state.photo_count > 0 ? `${state.photo_count} 张` : "未知"}）。业务文件估算 {state ? bytes(state.estimated_bytes) : "未知"}，不含照片，不代表 ZIP 大小或可用容量。实际数量以严格预览为准。</p>
       <div className="backup-actions">
         <button className="btn btn-primary" disabled={locked} onClick={() => void act(async () => { session.preview = null; track(await api.backup.startExport(photos)); })}>导出业务备份</button>
-        {operation?.kind === "export" && operation.status === "done" && <a className="btn btn-ghost" href={backupDownloadUrl(operation.id, false)} download target="_blank" rel="noopener" onClick={() => download(operation.id)}>下载业务备份</a>}
+        {operation?.kind === "export" && operation.status === "done" && <a className="btn btn-ghost" href={backupDownloadUrl(operation.id, false)} download target="_blank" rel="noopener" onClick={event => { event.preventDefault(); void download(operation.id, false); }}>下载业务备份</a>}
       </div>
       <h3>从 ZIP 预览恢复</h3>
       <label className="backup-file-label">选择业务备份 ZIP<input className="input" aria-label="选择业务备份 ZIP" type="file" accept=".zip,application/zip" disabled={locked} onChange={event => {
@@ -180,7 +220,7 @@ export default function BackupSettingsCard(): JSX.Element {
       <p>重启程序后才会生效。先复制未保存草稿并下载救援备份，再手动关闭服务端程序并重新打开。仅关闭或刷新浏览器不会重启服务端；此页面不会自动关闭任何程序。</p>
       <p>重启前可以取消恢复，继续使用当前资料。救援备份仍会保留。</p>
       <div className="backup-actions">
-        <a className="btn btn-ghost" href={backupDownloadUrl(prepared.rescue_id, true)} download target="_blank" rel="noopener" onClick={() => download(prepared.rescue_id)}>下载救援备份</a>
+        <a className="btn btn-ghost" href={backupDownloadUrl(prepared.rescue_id, true)} download target="_blank" rel="noopener" onClick={event => { event.preventDefault(); void download(prepared.rescue_id, true); }}>下载救援备份</a>
         <button className="btn btn-ghost" disabled={busy || safety.mode === "stale"} onClick={() => void act(async () => {
           await api.backup.cancelRestore(prepared.operation_id);
           session.pending = null; session.operation = null; session.preview = null;
@@ -193,11 +233,8 @@ export default function BackupSettingsCard(): JSX.Element {
       {state.rescues.map(rescue => <div className="backup-rescue" key={rescue.id}>
         <p>{rescue.created_at} · {bytes(rescue.size_bytes)} · {rescue.active ? "恢复使用中，不可删除" : "已完成救援材料"}</p>
         <div className="backup-actions">
-          {rescue.id !== prepared?.rescue_id && <a className="btn btn-ghost" href={backupDownloadUrl(rescue.id, true)} download target="_blank" rel="noopener" onClick={() => download(rescue.id)}>下载救援备份</a>}
+          {rescue.id !== prepared?.rescue_id && <a className="btn btn-ghost" href={backupDownloadUrl(rescue.id, true)} download target="_blank" rel="noopener" onClick={event => { event.preventDefault(); void download(rescue.id, true); }}>下载救援备份</a>}
           <button className="btn btn-danger" disabled={busy || rescue.active || session.downloads.has(rescue.id) || safety.mode === "stale"} onClick={() => setDeleteId(rescue.id)}>删除整组救援备份</button>
-          {session.downloads.has(rescue.id) && <button className="btn btn-ghost" onClick={() => {
-            session.downloads.delete(rescue.id); session.notice = "已按你的确认解除本页下载保护，服务端仍会拒绝删除正在下载的材料。"; publish();
-          }}>我已核实浏览器下载结束</button>}
         </div>
       </div>)}
     </div>}
