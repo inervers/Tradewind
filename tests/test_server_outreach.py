@@ -155,6 +155,26 @@ class ServerOutreachTests(unittest.TestCase):
         self.assertEqual(OutreachStore(self.db).get_job(created["id"])["status"], "pending_review")
         self.assertEqual(server.api_outreach_jobs()[0]["id"], created["id"])
 
+    def test_missing_customer_http_routes_block_email_and_whatsapp_before_transports(self):
+        email = self.create_email()
+        whatsapp = server.api_outreach_create(server.OutreachCreateRequest(
+            customer_id="c-001", channel="whatsapp", content="owned"))["item"]
+        self.customers.write_text("[]", encoding="utf-8")
+        with (
+            patch.object(server, "CredentialStore", side_effect=AssertionError("credential must not be read")),
+            patch.object(server.SmtpSender, "send", side_effect=AssertionError("SMTP must not run")),
+            patch.object(server, "build_whatsapp_link", side_effect=AssertionError("WA must not open")),
+            TestClient(server.app) as client,
+        ):
+            for item, action in ((email, "send-email"), (whatsapp, "open-whatsapp")):
+                response = client.post(f"/api/outreach/jobs/{item['id']}/{action}")
+                self.assertEqual(response.status_code, 200)
+                self.assertFalse(response.json()["ok"])
+                self.assertEqual(response.json()["code"], "customer_missing")
+            history = client.get("/api/outreach/jobs").json()
+        self.assertEqual({item["id"] for item in history}, {email["id"], whatsapp["id"]})
+        self.assertEqual({item["status"] for item in history}, {"pending_review"})
+
     def create_email(self) -> dict:
         with (
             patch.object(server, "get_email_outreach_config", return_value=EMAIL_CONFIG),

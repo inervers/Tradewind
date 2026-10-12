@@ -234,6 +234,11 @@ def acceptance(base, data, restart):
             expect(page.get_by_role("button", name="关闭客户跟进", exact=True)).to_be_disabled()
             page.get_by_role("button", name="设置", exact=True).click()
             expect(page.get_by_role("dialog", name="验收甲店", exact=True)).to_be_visible()
+            # busy is synchronous; the POST still awaits the epoch/readiness GET.
+            # Pump Playwright until the actual interception arrives, bounded.
+            dispatch_deadline = time.monotonic() + 8
+            while not held_requests and time.monotonic() < dispatch_deadline:
+                page.wait_for_timeout(20)
             assert len(held_requests) == 1
             held_requests[0].fulfill(status=503, content_type="application/json", body='{"detail":"验收模拟：稍后重试"}')
             expect(page.get_by_role("alert")).to_contain_text("稍后重试")

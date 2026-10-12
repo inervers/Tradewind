@@ -1,7 +1,7 @@
 """Owned source-web safety acceptance; synthetic HTTP only, never the live app.
 
 Run with the project's Python after npm run build:check. --test selects a
-focused unittest name. Task8 can add its UI group without replacing safety.
+focused unittest name; --group all includes safety, UI and real process tests.
 """
 from __future__ import annotations
 
@@ -13,13 +13,14 @@ import io
 import zipfile
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = ROOT / ".superpowers/sdd/2026-10-07-local-backup-restore"
+OUTPUT = ROOT / "outputs/backup-acceptance"
 OLD = "11111111-1111-4111-8111-111111111111"
 NEW = "22222222-2222-4222-8222-222222222222"
 COUNTS = dict.fromkeys("customers products templates crawler_seen emails outreach_jobs suppressions followup_records followup_deleted_requests followup_plans active_plans photos".split(), 0)
@@ -104,7 +105,7 @@ for (const name of ['api', 'tasks', 'types', 'dataEpoch']) {
                     state["state_reads"] += 1
                     return self.reply({"mode": state["mode"], "epoch": state["epoch"], "require_header": state["require_header"],
                                        "revision": state.get("revision", 0), "prepared": {"operation_id": "synthetic-op", "rescue_id": "synthetic-rescue", "status": "prepared"} if state["mode"] == "prepared" else None,
-                                       "rescues": state["rescues"], "report": {"status": "none", "operation_id": "", "code": "", "counts": COUNTS}, "estimated_bytes": 0, "photo_count": 0})
+                                       "rescues": state["rescues"], "report": {"status": "none", "operation_id": "", "code": "", "counts": COUNTS}, "estimated_bytes": state.get("estimated_bytes", 0), "photo_count": state.get("photo_count", 0)})
                 if self.command != "GET":
                     state["mutations"].append(request)
                     if state["require_header"] and request["epoch"] != state["epoch"]:
@@ -1005,15 +1006,241 @@ class UITests(SafetyTests):
                 self.expect(self.card.get_by_role("button", name="导出业务备份", exact=True)).to_be_enabled()
                 self.page.unroute("**/api/backup/restore/prepare", uncertain)
 
+    def test_photo_cache_is_labelled_stale_and_bytes_exclude_photos(self):
+        self.state.update(photo_count=3, estimated_bytes=2048)
+        self.settings()
+        self.expect(self.card).to_contain_text("缓存参考值可能过时（3 张）")
+        self.expect(self.card).to_contain_text("不含照片，不代表 ZIP 大小或可用容量")
+        self.expect(self.card.get_by_role("checkbox", name="包含照片", exact=True)).to_be_enabled()
+
+
+class RealServerTests(SafetyTests):
+    """Real HTTP/backend and real browser; fakes only at external transports."""
+    def setUp(self):
+        from playwright.sync_api import expect
+        from test_backup_roundtrip import BackupRoundtripTests
+        self.expect = expect
+        self.owned = BackupRoundtripTests()
+        self.addCleanup(self.owned.doCleanups)
+        self.owned.setUp()
+        self.base = self.owned.server.base
+        self.context = self.browser.new_context(viewport={"width": 375, "height": 740},
+                                                locale="zh-CN", timezone_id="Asia/Shanghai", reduced_motion="reduce")
+        self.external, self.errors = [], []
+        def local_only(route):
+            if route.request.url.startswith(self.base + "/"):
+                route.continue_()
+            else:
+                self.external.append("blocked-external-request")
+                route.abort()
+        self.context.route("**/*", local_only)
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(10000)
+        self.page.on("pageerror", lambda error: self.errors.append(str(error)))
+
+    def tearDown(self):
+        self.context.close()
+        self.owned.doCleanups()
+        self.assertEqual(self.external, [])
+        self.assertEqual(self.errors, [])
+
+    def settings(self, page):
+        self.open_page(page)
+        page.get_by_role("button", name="设置", exact=True).click()
+        return page.get_by_role("region", name="业务备份与恢复", exact=True)
+
+    def open_page(self, page):
+        page.goto(self.base)
+        self.expect(page.get_by_role("button", name="暂不配置，查看本机资料", exact=True)).to_be_visible()
+        page.get_by_role("button", name="暂不配置，查看本机资料", exact=True).click()
+
+    def test_real_restore_rescue_old_open_page_and_reloaded_task_reference(self):
+        server = self.owned.server
+        archive_a = server.export(True)
+        added = server.request("/api/customers", "POST", {"name": "合成B店"})[1]["item"]
+        self.owned.local_suppression()
+        self.open_page(self.page)
+        self.page.get_by_role("button", name="客户名单", exact=True).click()
+        self.page.get_by_role("button", name="跟进 合成甲店", exact=True).click()
+        field = self.page.get_by_label("沟通内容", exact=True)
+        field.fill("真实恢复前仍可复制的合成草稿")
+        old = server.epoch
+        controls = self.context.new_page()
+        card = self.settings(controls)
+        controls.get_by_label("选择业务备份 ZIP", exact=True).set_input_files(
+            {"name": "synthetic-A.zip", "mimeType": "application/zip", "buffer": archive_a})
+        self.expect(card.get_by_role("button", name="准备恢复", exact=True)).to_be_enabled()
+        card.get_by_role("button", name="准备恢复", exact=True).click()
+        controls.get_by_label("确认词", exact=True).fill("恢复")
+        controls.get_by_role("button", name="确认恢复", exact=True).click()
+        self.expect(card).to_contain_text("重启程序后", timeout=30000)
+        controls.screenshot(path=str(OUTPUT / "real-prepared-375.png"))
+        prepared = server.request("/api/backup/state")[1]["prepared"]
+        with controls.expect_download() as event:
+            card.get_by_role("link", name="下载救援备份", exact=True).click()
+        rescue_b = Path(event.value.path()).read_bytes()
+        server.restart()
+        self.page.evaluate("window.dispatchEvent(new Event('focus'))")
+        self.expect(self.page.locator(".data-maintenance-notice")).to_contain_text("重新打开")
+        self.expect(field).to_have_value("真实恢复前仍可复制的合成草稿")
+        self.page.get_by_role("button", name="保存沟通记录", exact=True).click()
+        self.assertEqual(self.owned.query("SELECT id FROM customer_followup_records"), [(5,)])
+        self.assertEqual([c["id"] for c in server.request("/api/customers")[1]], ["customer-甲"])
+        self.owned.assert_safety()
+        self.page.screenshot(path=str(OUTPUT / "real-stale-draft-375.png"))
+        # A newly opened restored page retires old compose reference without GET.
+        fresh = self.context.new_page()
+        checkpoint_requests = []
+        fresh.on("request", lambda request: checkpoint_requests.append(request.url)
+                 if request.url.endswith("/old-checkpoint") else None)
+        fresh.add_init_script(f"localStorage.setItem('tradewind.task.compose','old-checkpoint'); localStorage.setItem('tradewind.task.epoch',{json.dumps(old)});")
+        self.open_page(fresh)
+        self.expect(fresh.get_by_role("button", name="客户名单", exact=True)).to_be_visible()
+        self.assertEqual(checkpoint_requests, [])
+        self.assertIsNone(fresh.evaluate("localStorage.getItem('tradewind.task.compose')"))
+        server.prepare(rescue_b, "task9-web-rescue")
+        server.restart()
+        self.assertEqual({c["id"] for c in server.request("/api/customers")[1]}, {"customer-甲", added["id"]})
+        self.owned.assert_safety()
+        self.assertTrue(prepared["rescue_id"])
+
+    def test_real_native_stream_cancel_retains_ui_lock_until_manual_verification_and_server_release(self):
+        from test_backup_roundtrip import wait_until
+        server = self.owned.server
+        prepared = server.prepare(server.export(True), "task9-web-stream")
+        server.request("/api/backup/restore/cancel", "POST", {"operation_id": prepared["operation_id"]})
+        card = self.settings(self.page)
+        draft = self.page.get_by_placeholder("Demo User", exact=True)
+        # Settings has an independent initial config request. A visible backup
+        # card alone is not a readiness signal for the signature inputs.
+        self.expect(draft).to_have_value("Demo User", timeout=30000)
+        draft.fill("中断下载保留的合成签名")
+        draft.evaluate("element => { window.task9DraftNode = element; }")
+        self.page.evaluate("() => { Response.prototype.blob = () => { throw new Error('business blob forbidden'); }; }")
+        # Both real requests carry an observation header. Product preflight
+        # still checks headers and cancels its body before native navigation.
+        # The subsequent native response stays open until browser cancellation;
+        # no route fulfilment or replacement ZIP response is involved.
+        self.context.set_extra_http_headers({"X-Task9-Slow-Stream": "1"})
+        with self.page.expect_download() as event:
+            card.get_by_role("link", name="下载救援备份", exact=True).click()
+        download = event.value
+        wait_until(lambda: (self.owned.layout.data_dir.parent / "stream-started").exists())
+        delete = card.get_by_role("button", name="删除整组救援备份", exact=True)
+        self.expect(delete).to_be_disabled()
+        download.cancel()
+        self.assertIsNotNone(download.failure())
+        self.context.set_extra_http_headers({})
+        card.get_by_role("button", name="报告下载失败或取消", exact=True).click()
+        self.expect(card.get_by_role("alert")).to_contain_text("下载")
+        self.expect(delete).to_be_disabled()
+        self.expect(draft).to_have_value("中断下载保留的合成签名")
+        self.expect(card).not_to_contain_text("下载已完成")
+        wait_until(lambda: server.request("/__task9/evidence")[1]["rescue_owners"] == 0)
+        with self.page.expect_download() as retry:
+            card.get_by_role("link", name="重试下载", exact=True).click()
+        self.assertIsNone(retry.value.failure())
+        self.expect(delete).to_be_disabled()
+        card.get_by_role("button", name="我已核实浏览器下载结束", exact=True).click()
+        self.expect(delete).to_be_enabled()
+        delete.click()
+        self.page.get_by_role("button", name="确认删除整组", exact=True).click()
+        self.expect(delete).to_have_count(0)
+        self.assertFalse(server.request("/api/backup/state")[1]["rescues"])
+        self.assertTrue(draft.evaluate("element => element === window.task9DraftNode"))
+        self.expect(draft).to_have_value("中断下载保留的合成签名")
+
+    def diagnose_followup_dispatch_readiness(self):
+        # Focused controller-requested diagnosis, not an extra final all-group
+        # case. Hold only an owned readiness read, never forge a mutation result.
+        # Match the existing followup script's desktop viewport; a mobile drawer
+        # correctly covers sidebar navigation and must not be force-clicked.
+        self.page.set_viewport_size({"width": 1440, "height": 900})
+        self.open_page(self.page)
+        self.page.get_by_role("button", name="客户名单", exact=True).click()
+        self.page.get_by_role("button", name="跟进 合成甲店", exact=True).click()
+        content = self.page.get_by_label("沟通内容", exact=True)
+        self.expect(content).to_be_enabled()
+        held_states, held_records = [], []
+        state_url = self.base + "/api/backup/state"
+        record_url = "**/api/customers/*/followup/records"
+        def hold_state(route):
+            held_states.append(route)
+            self.page.evaluate("window.task9HeldState = true")
+        def hold_record(route):
+            held_records.append(route)
+            self.page.evaluate("window.task9HeldRecord = true")
+        self.page.route(state_url, hold_state)
+        self.page.route(record_url, hold_record)
+        content.fill("保存中不能离开的合成诊断草稿")
+        self.page.get_by_role("button", name="保存沟通记录", exact=True).click()
+        self.expect(self.page.get_by_role("button", name="关闭客户跟进", exact=True)).to_be_disabled()
+        self.page.wait_for_function("window.task9HeldState === true")
+        self.page.get_by_role("button", name="设置", exact=True).click()
+        self.expect(self.page.get_by_role("dialog", name="合成甲店", exact=True)).to_be_visible()
+        self.assertEqual(len(held_records), 0)
+        print("READINESS: busy=true panel=open POST count=0 while owned epoch read pending", flush=True)
+        self.page.unroute(state_url, hold_state)
+        for route in held_states:
+            route.continue_()
+        self.page.wait_for_function("window.task9HeldRecord === true")
+        self.assertEqual(len(held_records), 1)
+        held_records[0].fulfill(status=503, json={"detail": "合成诊断失败，保留草稿"})
+        self.expect(self.page.get_by_role("alert")).to_contain_text("保留草稿")
+        self.expect(content).to_have_value("保存中不能离开的合成诊断草稿")
+        print("READINESS: after actual epoch response POST count=1; failed-save draft retained", flush=True)
+
+
+class EvidenceResult(unittest.TextTestResult):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.records = []
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        self.record(test, "passed")
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self.record(test, "failed")
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        self.record(test, "error")
+
+    def record(self, test, status):
+        self.records.append({"test": test.id(), "status": status,
+                             "blocked_external_requests": len(getattr(test, "external", [])),
+                             "frontend_errors": len(getattr(test, "errors", []))})
+
 
 if __name__ == "__main__":
+    if not getattr(__import__("socket"), "_task9_fenced", False):
+        # Core --test is a unittest selector. Keep this browser script's
+        # selector in its own namespace while crossing that wrapper.
+        forwarded = ["--web-test" if arg == "--test" else arg.replace("--test=", "--web-test=", 1)
+                     if arg.startswith("--test=") else arg for arg in sys.argv[1:]]
+        raise SystemExit(subprocess.run([sys.executable, "-B", str(ROOT / "scripts/test-backup-core.py"),
+                                        "--script", "test-backup-web.py", *forwarded]).returncode)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--group", choices=["safety", "ui"], default="safety")
-    parser.add_argument("--test", action="append", default=[])
+    parser.add_argument("--group", choices=["safety", "ui", "all", "real"], default="all")
+    parser.add_argument("--test", "--web-test", action="append", default=[])
     arguments = parser.parse_args()
-    cls = UITests if arguments.group == "ui" else SafetyTests
-    own_names = [name for name in cls.__dict__ if name.startswith("test_")]
-    names = arguments.test or own_names
-    suite = unittest.TestSuite(cls(name) for name in names)
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    classes = {"safety": [SafetyTests], "ui": [UITests], "real": [RealServerTests],
+               "all": [SafetyTests, UITests, RealServerTests]}[arguments.group]
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    suite = unittest.TestSuite(cls(name) for cls in classes for name in
+                              (arguments.test or [name for name in cls.__dict__ if name.startswith("test_")]))
+    # Write a synthetic, path-free progress marker even if browser startup fails.
+    report = OUTPUT / "report.json"
+    report.write_text(json.dumps({"group": arguments.group, "status": "running"}), encoding="utf-8")
+    result = unittest.TextTestRunner(verbosity=2, resultclass=EvidenceResult).run(suite)
+    report.write_text(json.dumps({"group": arguments.group, "passed": result.wasSuccessful(),
+                                 "tests_run": result.testsRun, "failures": len(result.failures),
+                                 "errors": len(result.errors), "skipped": len(result.skipped),
+                                 "checks": result.records,
+                                 "blocked_external_requests": sum(r["blocked_external_requests"] for r in result.records),
+                                 "external_requests_asserted_in_teardown": result.wasSuccessful(),
+                                 "screenshots": sorted(p.name for p in OUTPUT.glob("*.png"))},
+                                ensure_ascii=False, indent=2), encoding="utf-8")
     raise SystemExit(not result.wasSuccessful())

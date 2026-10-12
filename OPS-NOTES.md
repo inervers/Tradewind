@@ -240,3 +240,66 @@ Tradewind 仅保留本地关键词检索实现，不再包含 RAGNEXUS 配置或
 - `scripts/test-followup-regressions.py` 使用独立合成环境验证嵌套关闭后的滚动、取消确认后的焦点，以及完成/取消的迟到重试不隐藏新安排。修复前已观察到四项失败，再执行修复后验收。
 - 诊断包测试加入合成私密跟进标记，保证正文、安排、请求编号均不进入 ZIP；无后台遥测，也不把跟进内容写入模型上下文。
 - 自动浏览器脚本 `scripts/test-followup-web.py` 使用临时数据和随机本机端口，在测试子进程中仅放行其自有 Origin，不改生产来源白名单。只用虚构配置，不请求外部模型、不发送邮件；持久化/双窗口冲突/丢失响应重试和 375/768/1440 布局均纳入验收。合成截图/结果位于被忽略的 `outputs/followup-acceptance/`。
+
+## 20. 本地业务备份与恢复（源码网页，发行包未更新）
+
+- 本轮不构建绿色包、EXE、Tauri 或 sidecar，不安装依赖，也不替用户重启实例。用户先验收源码网页，
+  后续发行构建另行授权。刷新网页只能重新绑定页面数据版本，不能运行启动恢复。
+- `app/backup/` 使用白名单快照，业务 JSON 与 SQLite 在同一维护租约内捕获；运行任务或真实 worker
+  尚未退出时拒绝备份。取消响应不等于后台写入已经停止，HTTP 租约覆盖真实响应生命周期。
+  revision 标识当前进程内业务修改；预览绑定 epoch/revision，资料变化或 30 分钟到期后重做预览。
+- `.data-epoch.json` 在恢复后持久化新版本；旧页面的修改返回 `stale_epoch`，保留草稿供复制。
+  请求携带原页面版本，不为提交静默刷新。`prepared` 表示完整救援与恢复材料已准备，
+  不表示业务已恢复；操作 `done` 同样不能代替启动结果 `restored`。
+- 只支持当前数据根内的标准 `data/tradewind_memory.db`，自定义 `MEMORY_DB_PATH` 拒绝备份恢复，
+  不擅自迁移、替换或忽略其它数据库。源码静态资源与可写数据根分离；验收仅模拟两个合成根，
+  不声称实际 portable/EXE 已通过验收。
+- 用户手动退出并启动同一实例、保持原 DataRoot，启动先验证恢复控制与 epoch，后导入业务、
+  初始化数据库和清理孤儿记录。不要为了恢复切换到旧包、另一个 ROOT 或桌面数据目录；
+  同机 Key/config 和 Windows 凭据保持原样，跨机需另行配置，维护过程中不应查看真实 Key。
+- 恢复前完整救援保存在 `data/backups/<救援编号>/`，每组包含 `rescue.zip` 与恢复控制文件。
+  取消恢复不删救援，恢复后可重新上传救援 ZIP 预览/准备并手动重启回滚业务；本机 DNC 仍取并集。
+  下载使用原生流，不转换整包 Blob。失败/取消需用户报告，确认下载结束只解除本页保护，
+  服务端下载 owner 尚未释放时仍拒绝删除；恢复中的材料不能删除。删除入口删除整组，
+  不自动淘汰、不手工拆删恢复 journal 或 `.backup-work/`。
+- 崩溃恢复依赖写前控制日志与原始文件移位记录。重启返回 `rolled_back` 时使用原业务与原 epoch；
+  无法确认完整回滚时 `blocked`，不得宣称健康就绪或继续业务初始化。保留救援/控制材料，
+  由维护人员在隔离副本中核验，不反复点击准备或删除文件“修复”。断电真实硬件验收未声称完成。
+- 白名单不含 checkpoint、任务、配置、Key、SMTP 设置、凭据、日志或浏览器 localStorage。
+  恢复清除旧工作流 checkpoint，外联 ID/跟进 ID 保持，禁止联系规则取并集。
+  邮件待处理/提交中任务需人工查发件箱；unknown 不直接回到待审核；确认已发/未发是人工决定，
+  不自动重试 SMTP。客户缺失时实际 HTTP 发送/WA 入口仍拒绝，历史保持可查。
+- 业务 ZIP 非脱敏。资源上限为 ZIP 2 GiB、解压 8 GiB、20,000 文件、照片单张 20 MiB、
+  JSON 单份 32 MiB、数据库 512 MiB、清单 8 MiB，磁盘预算另加 256 MiB。
+  照片缓存初始 0 意味着未测量，后续缓存可能过时；字节估算不含照片，不能当容量保证。
+
+主要错误码与处理（返回中文安全说明，不附原始路径/异常）
+
+| 错误码 | 处理 |
+|---|---|
+| `maintenance_busy` (503) | 等真实请求/worker/下载结束，不以取消按钮返回作为释放证明 |
+| `stale_epoch` (409) | 复制旧草稿后重新打开页面，不重放旧提交 |
+| `invalid_preview` / `stale_revision` (409) | 重新预览；只有明确 invalid_preview 且同 epoch、ready、无准备/运行操作时才退役旧准备请求 |
+| `prepare_conflict` (409) | 保留原请求身份并核验准备状态，不创建第二组救援 |
+| `custom_memory_path` (422) | 检查启动配置的数据根/标准数据库，不自动改路径 |
+| `resource_limit` (413) / `insufficient_space` (507) | 缩小合规输入或释放空间后重试；不静默截断 |
+| `not_found` (404) | 核实材料仍存在，失败下载不能显示完成 |
+| `restore_blocked` / `invalid_epoch_state` | 保留恢复控制与救援，在隔离副本排查，不绕开启动门禁 |
+| `source_changed` / `operation_failed` | 核实外部修改、磁盘/权限及捕获超时，不展示底层异常 |
+
+- 失去 prepare 确认响应时重试必须沿用原 preview_id/epoch/request_id；网络或未知错误不能
+  靠一次 ready 观察宣称准备失败并换请求。SQLite 捕获固定 30 秒预算与其错误分类留待终审，
+  不是对所有大数据库的性能保证；已知上游 Starlette 警告也留待终审，不声称输出 pristine。
+- `scripts/test-backup-core.py` 先创建 TemporaryDirectory 并剥离真实 `*_API_KEY`、`PYTHONPATH`、
+  `MEMORY_DB_PATH`、`LOCAL_KB_PATH`、`TRADEWIND_DATA_DIR`、`TRADEWIND_NO_BROWSER`，再设置自有值。
+  应用导入前安装网络防线及无系统 keyring 替身，并禁止 webbrowser/startfile 的真实启动，Python 子进程继承。
+  测试中性 `TRADEWIND_NO_BROWSER=0` 让已 mock 的启动器正常分支可测，真实验收服务显式设为 1；
+  不能把环境开关当作实际浏览器启动防线。只放行测试 bind(0)
+  登记的回环端口/自有 Origin，拒绝 8101、未拥有端口、外部 DNS/连接及真实源码 data/.env 读取。
+  外部模型/SMTP 仅使用合成替身，真实 Windows 凭据不可访问。
+- 默认完整 unittest，`--test` 供迭代聚焦；`--script` 包装既有跟进网页脚本，在同一防线下运行。
+  backup web `--group all` 合并 safety/UI/真实服务器浏览器用例，结果为
+  `outputs/backup-acceptance/report.json` 和小屏合成截图。故意 mutant 失败单独标为测试 sanity，
+  环境/夹具失败不冒充产品 RED。最终文件确定后完整后端、compileall、type/build 与所有网页门禁各执行一次。
+- 本轮安全检查限于候选源码/测试/文档与精确暂存清单；使用现有五项提交钩子，不绕过钩子。
+  CI Secrets Scan workflow 仅核验配置，不能声称 CI 已运行；人工语义脱敏由用户授权委派的审计负责。
