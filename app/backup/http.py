@@ -5,13 +5,16 @@ from dataclasses import asdict
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import threading
+import re
 import anyio
+from starlette.staticfiles import StaticFiles
 
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
 
 from .models import BackupError
+from .paths import _checked_path
 
 
 def error_response(exc):
@@ -72,6 +75,21 @@ class BackupMaintenanceMiddleware:
         path = scope.get("path", "")
         if scope["type"] != "http" or path == "/api/health":
             return await self.app(scope, receive, send)
+        # Only the installed frontend's fixed HTML and existing compiled JS/CSS.
+        # No arbitrary GET, SPA fallback, data path or missing asset exemption.
+        if scope["method"] in {"GET", "HEAD"} and (path in {"/", "/index.html"}
+                or re.fullmatch(r"/assets/[A-Za-z0-9_-]+\.(?:js|css)", path)):
+            for route in getattr(getattr(scope.get("app"), "router", None), "routes", ()):
+                if (getattr(route, "name", None) == "frontend" and getattr(route, "path", None) == ""
+                        and isinstance(getattr(route, "app", None), StaticFiles)):
+                    relative = "index.html" if path == "/" else path.lstrip("/")
+                    available = False
+                    try:
+                        available = _checked_path(Path(route.app.directory) / relative).is_file()
+                    except (BackupError, OSError):
+                        pass  # Unsafe/unavailable static material gets no bypass.
+                    if available:
+                        return await self.app(scope, receive, send)
         mutating = scope["method"] in {"POST", "PUT", "PATCH", "DELETE"}
         headers = dict(scope.get("headers", []))
         raw_epoch = headers.get(b"x-tradewind-data-epoch")

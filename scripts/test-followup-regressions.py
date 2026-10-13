@@ -20,7 +20,7 @@ def run_regressions(base: str) -> None:
     results = []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(channel="msedge", headless=True)
-        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context = browser.new_context(viewport={"width": 1440, "height": 900}, reduced_motion="reduce")
         external = []
 
         def local_only(route):
@@ -35,7 +35,16 @@ def run_regressions(base: str) -> None:
         def open_page():
             page = context.new_page()
             page.set_default_timeout(8000)
-            page.goto(base)
+            with page.expect_response(lambda response: response.url == base + "/api/config"
+                                      and response.status == 200, timeout=30000):
+                page.goto(base)
+            page.bring_to_front()
+            assert page.evaluate("""() => new Promise(resolve => {
+                const deadline = setTimeout(() => resolve(false), 10000);
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    clearTimeout(deadline); resolve(true);
+                }));
+            })"""), "owned browser did not deliver two rendering frames within 10 seconds"
             page.get_by_role("button", name="客户名单", exact=True).click()
             page.get_by_role("button", name="跟进 验收甲店", exact=True).click()
             expect(page.get_by_label("沟通内容", exact=True)).to_be_enabled()

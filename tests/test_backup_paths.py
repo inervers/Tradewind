@@ -14,6 +14,20 @@ from unittest.mock import patch
 
 
 class BackupPathTests(unittest.TestCase):
+    def test_deletion_receipt_namespace_is_exact_and_never_an_archive_member(self):
+        id = "11111111-1111-4111-8111-111111111111"
+        for suffix in ("json", "tmp"):
+            name = f".backup-deletions/{id}.{suffix}"
+            self.assertEqual(self.paths.owned_path(self.layout, name), self.layout.data_dir / name)
+            with self.assertRaises(self.models.BackupError):
+                self.paths.validate_member_path("data/" + name)
+        for name in (".backup-deletions/foreign.json", ".backup-deletions/config.json",
+                     f".backup-deletions/{id}/x", f".backup-deletions/{id}.zip",
+                     ".backup-deletions/11111111-1111-1111-8111-111111111111.json"):
+            with self.subTest(name=name), self.assertRaises(self.models.BackupError):
+                self.paths.owned_path(self.layout, name)
+        self.assertFalse(self.layout.data_dir.exists())
+
     def setUp(self) -> None:
         # Import here so absent production modules produce an observed RED.
         self.models = importlib.import_module("app.backup.models")

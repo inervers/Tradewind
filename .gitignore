@@ -57,6 +57,7 @@ data/crawler_seen.json
 data/crawler_photos/
 data/photo_scan/
 data/.backup-work/
+data/.backup-deletions/
 data/backups/
 data/.data-epoch.json
 data/server-*.log

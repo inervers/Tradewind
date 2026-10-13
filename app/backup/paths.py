@@ -12,6 +12,7 @@ from pathlib import Path, PureWindowsPath
 import shutil
 import stat
 import unicodedata
+import uuid
 
 from .models import BackupError, BackupLayout, BackupLimits
 
@@ -130,8 +131,15 @@ def owned_path(layout: BackupLayout, relative: str) -> Path:
     cleanup capability and must never be taken from uploaded ZIP target names.
     """
     parts = _parts(relative)
+    deletion = parts == (".backup-deletions",)
+    if len(parts) == 2 and parts[0] == ".backup-deletions" and parts[1].endswith((".json", ".tmp")):
+        stem = parts[1].rsplit(".", 1)[0]
+        try:
+            deletion = str(uuid.UUID(stem)) == stem and uuid.UUID(stem).version == 4
+        except ValueError:
+            pass
     if not (_business_path(parts) or parts[0] in _CONTROL_DIRECTORIES
-            or parts == (".data-epoch.json",)):
+            or parts == (".data-epoch.json",) or deletion):
         raise _invalid_path()
     data_dir = _checked_path(layout.data_dir)
     target = _checked_path(data_dir.joinpath(*parts))

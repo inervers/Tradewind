@@ -18,8 +18,9 @@ export interface RestorePreview {
 export interface PreparedRestore { operation_id: string; rescue_id: string; status: "prepared" }
 export interface RestoreOutcome {
   status: "none" | "restored" | "rolled_back" | "blocked";
-  operation_id: string; code: string; counts: BackupCounts;
+  operation_id: string; code: string; counts: RestoreSafetyCounts;
 }
+export type RestoreSafetyCounts = Partial<Record<"suppressions_added" | "suppressed_jobs" | "email_requires_sentbox_check" | "whatsapp_requires_review", number>>;
 export interface OperationView {
   id: string; kind: "export" | "preview" | "prepare";
   status: "running" | "done" | "cancelled" | "error";

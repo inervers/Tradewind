@@ -204,6 +204,7 @@ def _read_journal(layout, operation):
 def _read_recovery_state(layout: BackupLayout):
     """Read-only Service interface; strict fixed journals, at most one active."""
     try:
+        deletions = _read_deletions(layout)
         root = owned_path(layout, "backups")
         _check(root == layout.rescue_dir)
         if not root.exists():
@@ -216,7 +217,7 @@ def _read_recovery_state(layout: BackupLayout):
             directory = _op_path(layout, operation)
             _check(directory.is_dir())
             journal = _op_path(layout, operation, "recovery.json")
-            if journal.exists():
+            if journal.exists() and operation not in deletions:
                 documents.append(_read_journal(layout, operation))
         active = [document for document in documents if document["state"] in _ACTIVE_STATES]
         _check(len(active) <= 1)
@@ -225,6 +226,79 @@ def _read_recovery_state(layout: BackupLayout):
         raise
     except (OSError, ValueError, TypeError, RecursionError):
         raise _error("invalid_recovery_state") from None
+
+
+def _deletion_path(layout, operation, suffix="json"):
+    _check(suffix in {"json", "tmp"})
+    return owned_path(layout, ".backup-deletions/" + _operation(operation) + "." + suffix)
+
+
+def _validate_deletion(document, operation):
+    _check(type(document) is dict and set(document) == {
+        "format_version", "operation_id", "directory_identity", "journal"})
+    _check(type(document["format_version"]) is int and document["format_version"] == 1)
+    _check(document["operation_id"] == _operation(operation))
+    identity = document["directory_identity"]
+    _check(type(identity) is list and len(identity) == 2
+           and all(type(value) is int and value >= 0 for value in identity) and identity[1] > 0)
+    journal = _validate_control(document["journal"], operation)
+    _check(journal["state"] in {"cancelled", "committed", "rolled_back"})
+    return document
+
+
+def _read_deletions(layout):
+    """Read-only fixed receipts. Scratch/ambiguity never authorizes cleanup."""
+    try:
+        root = owned_path(layout, ".backup-deletions")
+        if not root.exists():
+            return {}
+        _check(root.is_dir())
+        receipts = {}
+        for file in root.iterdir():
+            # A leftover .tmp (with or without a receipt) fails closed. It is
+            # not silently removed or treated as a published deletion intent.
+            _check(file.suffix == ".json")
+            operation = _operation(file.stem)
+            file = _deletion_path(layout, operation)
+            _check(file.is_file())
+            with file.open("rb") as stream:
+                raw = stream.read(2 * _CONTROL_BOUND + 1)
+            _check(len(raw) <= 2 * _CONTROL_BOUND)
+            receipt = _validate_deletion(json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs,
+                parse_constant=lambda value: (_check(False))), operation)
+            folder = _op_path(layout, operation)
+            if folder.exists():
+                _check(folder.is_dir() and _identity(folder) == tuple(receipt["directory_identity"]))
+                journal = _op_path(layout, operation, "recovery.json")
+                if journal.exists():
+                    _check(_read_journal(layout, operation) == receipt["journal"])
+            receipts[operation] = receipt
+        return receipts
+    except BackupError:
+        raise
+    except (OSError, ValueError, TypeError, RecursionError):
+        raise _error("invalid_recovery_state") from None
+
+
+def _publish_deletion(layout, operation, journal):
+    """Terminal journal + original directory identity, durable before unlink."""
+    _read_deletions(layout)
+    folder = _op_path(layout, operation)
+    receipt = _validate_deletion({"format_version": 1, "operation_id": operation,
+        "directory_identity": list(_identity(folder)), "journal": journal}, operation)
+    raw = json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    _check(len(raw) <= 2 * _CONTROL_BOUND)
+    root = owned_path(layout, ".backup-deletions")
+    root.mkdir(exist_ok=True)
+    _check(not _deletion_path(layout, operation).exists())
+    temporary = _deletion_path(layout, operation, "tmp")
+    with temporary.open("xb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(_deletion_path(layout, operation, "tmp"), _deletion_path(layout, operation))
+    _sync_directory(root)
+    return receipt
 
 
 def _persist(layout, document):

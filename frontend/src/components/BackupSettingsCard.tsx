@@ -11,7 +11,7 @@ const session: {
   pending: { previewId: string; epoch: string; requestId: string; rejected?: boolean } | null;
   upload: AbortController | null; uploaded: number; uploadTotal: number;
   busy: boolean; error: string; notice: string;
-  downloads: Map<string, { rescue: boolean; checking: boolean; failed: boolean }>;
+  downloads: Map<string, { rescue: boolean; checking: boolean; failed: boolean; createdAt: string }>;
 } = { state: null, operation: null, preview: null, pending: null, upload: null,
   uploaded: 0, uploadTotal: 0, busy: false, error: "", notice: "", downloads: new Map() };
 const listeners = new Set<() => void>();
@@ -33,11 +33,23 @@ async function refresh(): Promise<void> {
   if (session.pending?.rejected && next.mode === "ready" && !next.prepared
       && next.epoch === session.pending.epoch && !session.operation?.prepared
       && !(session.operation?.kind === "prepare" && session.operation.status === "running")) {
+    // Keep identities on failed/uncertain cancellation. A ready observation is
+    // not evidence that the service's single preview slot has been released.
+    await releasePreview();
     session.pending = null; session.preview = null; session.operation = null;
     session.error = "预览已失效，恢复未准备。请重新选择 ZIP 进行预览，或导出当前业务备份；已有草稿仍保留。";
   }
   session.state = next;
   publish();
+}
+
+async function releasePreview(): Promise<void> {
+  const preview = session.preview;
+  if (!preview) return;
+  await api.backup.cancelOperation(preview.id);
+  const operation = await api.backup.getOperation(preview.id);
+  if (operation.status !== "cancelled") throw new Error("preview release unconfirmed");
+  if (session.preview === preview) session.preview = null;
 }
 
 function track(operation: OperationView): void {
@@ -91,7 +103,7 @@ async function prepare(): Promise<void> {
 
 async function download(id: string, rescue: boolean): Promise<void> {
   if (session.downloads.get(id)?.checking) return;
-  const attempt = { rescue, checking: true, failed: false };
+  const attempt = { rescue, checking: true, failed: false, createdAt: new Date().toISOString() };
   session.downloads.set(id, attempt); publish();
   try {
     await checkBackupDownload(id, rescue);
@@ -112,6 +124,15 @@ const labels: Record<keyof BackupCounts, string> = {
   followup_plans: "跟进安排", active_plans: "有效跟进安排", photos: "照片",
 };
 const bytes = (value: number) => `${(Math.max(0, value) / 1024 / 1024).toFixed(1)} MiB`;
+// Explicit UTC keeps archived ISO and rescue Unix-seconds identities comparable.
+const materialDate = (value: string) => {
+  const date = new Date(/^\d+(?:\.\d+)?$/.test(value) ? Number(value) * 1000 : value);
+  return Number.isFinite(date.getTime()) ? `${new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "UTC", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).format(date)} UTC` : "时间未知";
+};
+const shortId = (id: string) => id.slice(0, 8);
 const phases: Record<string, string> = { capture: "采集快照", compress: "压缩备份", validate: "校验备份", inspect: "检查资料", rescue: "制作救援备份", prepare: "准备恢复", done: "服务端阶段完成" };
 
 export default function BackupSettingsCard(): JSX.Element {
@@ -139,15 +160,20 @@ export default function BackupSettingsCard(): JSX.Element {
 
   const uploadFile = (file: File) => {
     if (locked) return;
-    session.preview = null; session.operation = null; session.error = "";
-    session.uploaded = 0; session.uploadTotal = file.size;
-    const controller = new AbortController();
-    session.upload = controller; publish();
-    void api.backup.startPreview(file, controller.signal, (loaded, total) => {
-      session.uploaded = loaded; session.uploadTotal = total; publish();
-    }).then(track).catch(error => {
-      session.error = error instanceof DOMException && error.name === "AbortError" ? "上传已取消，资料未恢复。请刷新状态后再选择文件。" : safeError;
-    }).finally(() => { session.upload = null; publish(); void refresh().catch(() => {}); });
+    void act(async () => {
+      await releasePreview();
+      session.operation = null; session.error = "";
+      session.uploaded = 0; session.uploadTotal = file.size;
+      const controller = new AbortController();
+      session.upload = controller; publish();
+      try {
+        track(await api.backup.startPreview(file, controller.signal, (loaded, total) => {
+          session.uploaded = loaded; session.uploadTotal = total; publish();
+        }));
+      } catch (error) {
+        session.error = error instanceof DOMException && error.name === "AbortError" ? "上传已取消，资料未恢复。请刷新状态后再选择文件。" : safeError;
+      } finally { session.upload = null; publish(); await refresh(); }
+    });
   };
 
   return <section className="card backup-settings-card" data-backup-controls aria-label="业务备份与恢复">
@@ -155,11 +181,15 @@ export default function BackupSettingsCard(): JSX.Element {
     <p className="backup-warning">业务备份含客户资料，是未加密的私密 ZIP，请勿公开分享。</p>
     <p>模型/API Key、公司资料与签名、SMTP/邮箱设置及 Windows 凭据不在备份内。换电脑后需重新配置；未审核草稿、未保存表单不在备份内，请先复制保存。</p>
     <p>恢复不会自动停止或重启程序，也不会自动发送邮件或 WhatsApp。</p>
-    {state?.report.status === "restored" && <p role="status">重启后的恢复已生效。请核查邮箱发件箱，重新配置设置后再人工确认发送。</p>}
+    {state?.report.status === "restored" && <div role="status">
+      <p>重启后的恢复已生效。请核查邮箱发件箱，重新配置设置后再人工确认发送。</p>
+      <p>新增禁止联系规则 {state.report.counts.suppressions_added ?? 0} · 已抑制外联任务 {state.report.counts.suppressed_jobs ?? 0} · 邮件需核查发件箱 {state.report.counts.email_requires_sentbox_check ?? 0} · WhatsApp 需人工复核 {state.report.counts.whatsapp_requires_review ?? 0}</p>
+    </div>}
     {state?.report.status === "rolled_back" && <p role="status">恢复未完成，程序已回滚。请保留救援备份并检查资料。</p>}
     {error && <p className="backup-error" role="alert">{error}</p>}
     {notice && <p role="status">{notice}</p>}
-    {Array.from(session.downloads, ([id, attempt]) => <div key={id}>
+    {Array.from(session.downloads, ([id, attempt]) => <div key={id} data-backup-material>
+      <p>{attempt.rescue ? "救援备份" : "业务备份"} · {shortId(id)} · 下载发起时间 {materialDate(attempt.createdAt)}</p>
       {attempt.checking ? <p role="status">正在检查下载地址，不代表下载完成…</p>
         : attempt.failed ? <p className="backup-error" role="alert">下载检查失败或你已报告下载失败／取消。请重试下载；本页删除保护仍保留，先核实浏览器传输已结束。</p>
           : <p role="status">本次下载由浏览器处理；页面无法确认传输是否完成。若浏览器显示失败或取消，请在此报告并重试。</p>}
@@ -180,7 +210,7 @@ export default function BackupSettingsCard(): JSX.Element {
       <label className="backup-photo-option"><input type="checkbox" checked={photos} disabled={locked} onChange={event => setPhotos(event.target.checked)} />包含照片</label>
       <p>照片数量尚未测量；缓存参考值可能过时（{state && state.photo_count > 0 ? `${state.photo_count} 张` : "未知"}）。业务文件估算 {state ? bytes(state.estimated_bytes) : "未知"}，不含照片，不代表 ZIP 大小或可用容量。实际数量以严格预览为准。</p>
       <div className="backup-actions">
-        <button className="btn btn-primary" disabled={locked} onClick={() => void act(async () => { session.preview = null; track(await api.backup.startExport(photos)); })}>导出业务备份</button>
+        <button className="btn btn-primary" disabled={locked} onClick={() => void act(async () => { await releasePreview(); track(await api.backup.startExport(photos)); })}>导出业务备份</button>
         {operation?.kind === "export" && operation.status === "done" && <a className="btn btn-ghost" href={backupDownloadUrl(operation.id, false)} download target="_blank" rel="noopener" onClick={event => { event.preventDefault(); void download(operation.id, false); }}>下载业务备份</a>}
       </div>
       <h3>从 ZIP 预览恢复</h3>
@@ -208,6 +238,7 @@ export default function BackupSettingsCard(): JSX.Element {
 
     {preview && !prepared && <div className="backup-preview">
       <h3>严格预览 · 数量对照</h3>
+      <p>备份时间 {materialDate(preview.backup.created_at)} · 应用版本 {preview.backup.app_version}</p>
       <table><thead><tr><th>业务项目</th><th>备份</th><th>当前</th></tr></thead><tbody>
         {(Object.keys(labels) as (keyof BackupCounts)[]).map(key => <tr key={key}><th scope="row">{labels[key]}</th><td>{preview.backup.counts[key]}</td><td>{preview.current.counts[key]}</td></tr>)}
       </tbody></table>
@@ -231,9 +262,9 @@ export default function BackupSettingsCard(): JSX.Element {
 
     {!!state?.rescues.length && <div className="backup-rescues"><h3>救援备份 · 整组管理</h3>
       {state.rescues.map(rescue => <div className="backup-rescue" key={rescue.id}>
-        <p>{rescue.created_at} · {bytes(rescue.size_bytes)} · {rescue.active ? "恢复使用中，不可删除" : "已完成救援材料"}</p>
+        <p>救援备份 · {shortId(rescue.id)} · {materialDate(rescue.created_at)} · {bytes(rescue.size_bytes)} · {rescue.active ? "恢复使用中，不可删除" : rescue.size_bytes === 0 ? "删除未完成，可重试整组删除" : "已完成救援材料"}</p>
         <div className="backup-actions">
-          {rescue.id !== prepared?.rescue_id && <a className="btn btn-ghost" href={backupDownloadUrl(rescue.id, true)} download target="_blank" rel="noopener" onClick={event => { event.preventDefault(); void download(rescue.id, true); }}>下载救援备份</a>}
+          {rescue.size_bytes > 0 && rescue.id !== prepared?.rescue_id && <a className="btn btn-ghost" href={backupDownloadUrl(rescue.id, true)} download target="_blank" rel="noopener" onClick={event => { event.preventDefault(); void download(rescue.id, true); }}>下载救援备份</a>}
           <button className="btn btn-danger" disabled={busy || rescue.active || session.downloads.has(rescue.id) || safety.mode === "stale"} onClick={() => setDeleteId(rescue.id)}>删除整组救援备份</button>
         </div>
       </div>)}
@@ -244,6 +275,7 @@ export default function BackupSettingsCard(): JSX.Element {
       session.pending = { previewId: preview.id, epoch: preview.epoch, requestId: crypto.randomUUID() };
       setConfirm(false); void prepare();
     }} content={<div className="backup-confirm-content">
+      <p>备份时间 {materialDate(preview.backup.created_at)} · 应用版本 {preview.backup.app_version}</p>
       <p>恢复将替换白名单业务资料；先成功生成完整救援备份，再准备恢复。</p>
       <p>{preview.backup.includes_photos ? "照片与照片扫描结果将被替换。" : "不含照片，保留当前照片与照片扫描结果。"}</p>
       <p>禁止联系规则取并集，避免恢复后再次联系禁联客户。</p>
@@ -251,7 +283,7 @@ export default function BackupSettingsCard(): JSX.Element {
       <p>模型、Key、公司签名及 SMTP 设置不会恢复。未审核草稿请先复制。准备后尚未应用，手动重启服务端才生效；程序不会自动停止。</p>
       <label>确认词<input className="input" aria-label="确认词" value={word} onChange={event => setWord(event.target.value)} placeholder="请输入：恢复" /></label>
     </div>} />}
-    {deleteId && <ConfirmDialog backupControls title="删除整组救援备份？" desc="将删除这一组救援快照和 ZIP，不能撤销。恢复使用中或下载中的材料不能删除。" confirmText="确认删除整组" busy={busy} onCancel={() => setDeleteId(null)} onConfirm={() => void act(async () => {
+    {deleteId && <ConfirmDialog backupControls title="删除整组救援备份？" desc={`将删除救援备份 ${shortId(deleteId)} 的整组快照、ZIP、保留的旧未审核 checkpoint 草稿及原始照片，不能撤销。恢复使用中或下载中的材料不能删除。`} confirmText="确认删除整组" busy={busy} onCancel={() => setDeleteId(null)} onConfirm={() => void act(async () => {
       await api.backup.deleteRescue(deleteId); setDeleteId(null); await refresh(); session.notice = "整组救援备份已删除，无法恢复。";
     })} />}
   </section>;

@@ -26,6 +26,19 @@ NEW = "22222222-2222-4222-8222-222222222222"
 COUNTS = dict.fromkeys("customers products templates crawler_seen emails outreach_jobs suppressions followup_records followup_deleted_requests followup_plans active_plans photos".split(), 0)
 
 
+def activate_owned_page(page):
+    """Prove this owned headless tab is rendering, without bypassing clicks."""
+    page.bring_to_front()
+    frames = page.evaluate("""() => new Promise(resolve => {
+        const deadline = setTimeout(() => resolve(false), 10000);
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            clearTimeout(deadline); resolve(true);
+        }));
+    })""")
+    if not frames:
+        raise AssertionError("owned browser did not deliver two rendering frames within 10 seconds")
+
+
 @contextmanager
 def fixture_server():
     # Compile the real shared modules into an owned temporary browser harness.
@@ -105,7 +118,7 @@ for (const name of ['api', 'tasks', 'types', 'dataEpoch']) {
                     state["state_reads"] += 1
                     return self.reply({"mode": state["mode"], "epoch": state["epoch"], "require_header": state["require_header"],
                                        "revision": state.get("revision", 0), "prepared": {"operation_id": "synthetic-op", "rescue_id": "synthetic-rescue", "status": "prepared"} if state["mode"] == "prepared" else None,
-                                       "rescues": state["rescues"], "report": {"status": "none", "operation_id": "", "code": "", "counts": COUNTS}, "estimated_bytes": state.get("estimated_bytes", 0), "photo_count": state.get("photo_count", 0)})
+                                       "rescues": state["rescues"], "report": {"status": "none", "operation_id": "", "code": "", "counts": {}}, "estimated_bytes": state.get("estimated_bytes", 0), "photo_count": state.get("photo_count", 0)})
                 if self.command != "GET":
                     state["mutations"].append(request)
                     if state["require_header"] and request["epoch"] != state["epoch"]:
@@ -130,7 +143,7 @@ for (const name of ['api', 'tasks', 'types', 'dataEpoch']) {
                         state["upload_bytes"] = len(body)
                         if state.get("upload_gate") is not None:
                             state["upload_gate"].wait(timeout=10)
-                        preview = {"id": "preview-id", "archive_sha256": "a" * 64, "epoch": OLD, "revision": state.get("revision", 0),
+                        preview = {"id": "preview-op", "archive_sha256": "a" * 64, "epoch": OLD, "revision": state.get("revision", 0),
                                    "expires_at": 9999999999, "backup": summary, "current": {**summary, "counts": {**COUNTS, "customers": 1}}}
                         state["operations"]["preview-op"] = operation("preview-op", "preview", preview=preview)
                         return self.reply(state["operations"]["preview-op"])
@@ -245,7 +258,15 @@ class SafetyTests(unittest.TestCase):
         self.page.wait_for_function("window.harnessReady")
 
     def app(self):
-        self.page.goto(self.base)
+        if self.state["mode"] == "ready":
+            # A rendered navigation shell is not proof its config hydration has
+            # completed. Observe the real owned response, never replace it.
+            with self.page.expect_response(lambda response: response.url == self.base + "/api/config"
+                                           and response.status == 200, timeout=30000):
+                self.page.goto(self.base)
+        else:
+            self.page.goto(self.base)
+        activate_owned_page(self.page)
 
     def panel(self):
         self.app()
@@ -571,6 +592,57 @@ class SafetyTests(unittest.TestCase):
 
 
 class UITests(SafetyTests):
+    def test_archive_dates_versions_and_material_safety_identity(self):
+        dates = iter((("2026-09-01T00:00:00Z", "synthetic-A"), ("2026-10-12T00:00:00Z", "synthetic-B")))
+        def identified(route):
+            response = route.fetch()
+            body = response.json()
+            date, version = next(dates)
+            body["preview"]["backup"].update(created_at=date, app_version=version)
+            route.fulfill(response=response, json=body)
+        self.page.route("**/api/backup/preview", identified)
+        self.preview()
+        for index, (date, version) in enumerate((("2026/09/01", "synthetic-A"), ("2026/10/12", "synthetic-B"))):
+            if index:
+                self.page.get_by_label("选择业务备份 ZIP", exact=True).set_input_files(
+                    {"name": "other.zip", "mimeType": "application/zip", "buffer": b"other-zip"})
+            self.expect(self.card.locator(".backup-preview")).to_contain_text(version)
+            self.expect(self.card.locator(".backup-preview")).to_contain_text(date)
+            self.expect(self.card.locator(".backup-preview")).to_contain_text("UTC")
+            self.expect(self.card.locator(".backup-preview")).to_contain_text("3")
+            self.card.get_by_role("button", name="准备恢复", exact=True).click()
+            dialog = self.page.get_by_role("dialog", name="确认准备恢复业务资料？")
+            self.expect(dialog).to_contain_text(version)
+            self.expect(dialog).to_contain_text(date)
+            self.expect(dialog).to_contain_text("UTC")
+            dialog.get_by_role("button", name="取消", exact=True).click()
+        self.state["rescues"] = [{"id": "12345678-synthetic", "created_at": "1791763200", "size_bytes": 128, "active": False}]
+        def restored(route):
+            response = route.fetch()
+            body = response.json()
+            body["report"] = {"status": "restored", "operation_id": "synthetic", "code": "", "counts": {
+                "suppressions_added": 2, "suppressed_jobs": 3, "email_requires_sentbox_check": 4, "whatsapp_requires_review": 5}}
+            route.fulfill(response=response, json=body)
+        self.page.route("**/api/backup/state", restored)
+        self.card.get_by_role("button", name="刷新备份状态", exact=True).click()
+        self.expect(self.card).to_contain_text("新增禁止联系规则 2")
+        self.expect(self.card).to_contain_text("已抑制外联任务 3")
+        self.expect(self.card).to_contain_text("邮件需核查发件箱 4")
+        self.expect(self.card).to_contain_text("WhatsApp 需人工复核 5")
+        group = self.card.locator(".backup-rescue")
+        self.expect(group).to_contain_text("2026/10/12")
+        self.expect(group).to_contain_text("UTC")
+        self.expect(group).to_contain_text("12345678")
+        with self.page.expect_download():
+            group.get_by_role("link", name="下载救援备份", exact=True).click()
+        attempt = self.card.locator("[data-backup-material]")
+        self.expect(attempt).to_contain_text("救援备份")
+        self.expect(attempt).to_contain_text("12345678")
+        self.expect(attempt).to_contain_text("UTC")
+        attempt.get_by_role("button", name="我已核实浏览器下载结束", exact=True).click()
+        group.get_by_role("button", name="删除整组救援备份", exact=True).click()
+        self.expect(self.page.get_by_role("dialog")).to_contain_text("未审核 checkpoint 草稿")
+
     # Only own UI tests, not a second inherited run of the safety group.
     def settings(self):
         self.app()
@@ -669,6 +741,7 @@ class UITests(SafetyTests):
             field = self.page.get_by_label("确认词", exact=True)
             self.expect(field).to_be_focused()
             dialog = self.page.get_by_role("dialog", name="确认准备恢复业务资料？")
+            self.expect(dialog).to_have_css("transform", "none")
             self.assertLessEqual(dialog.bounding_box()["height"], 648)
             self.assertTrue(self.page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
             for button in dialog.get_by_role("button").all():
@@ -1015,6 +1088,39 @@ class UITests(SafetyTests):
 
 
 class RealServerTests(SafetyTests):
+    def test_real_replacement_revision_repreview_and_fresh_prepared_cancel(self):
+        server = self.owned.server
+        archive = server.export(False)
+        card = self.settings(self.page)
+        field = self.page.get_by_label("选择业务备份 ZIP", exact=True)
+        def upload(name):
+            self.expect(field).to_be_enabled()
+            field.set_input_files({"name": name, "mimeType": "application/zip", "buffer": archive})
+            self.expect(card.get_by_role("button", name="准备恢复", exact=True)).to_be_enabled(timeout=30000)
+        upload("wrong.zip")
+        upload("replacement.zip")
+        self.expect(card.get_by_role("alert")).to_have_count(0)
+        server.request("/api/customers", "POST", {"name": "合成修改使预览失效"})
+        card.get_by_role("button", name="准备恢复", exact=True).click()
+        self.page.get_by_label("确认词", exact=True).fill("恢复")
+        self.page.get_by_role("button", name="确认恢复", exact=True).click()
+        self.expect(card).to_contain_text("预览已失效", timeout=30000)
+        upload("repreview.zip")
+        card.get_by_role("button", name="准备恢复", exact=True).click()
+        self.page.get_by_label("确认词", exact=True).fill("恢复")
+        self.page.get_by_role("button", name="确认恢复", exact=True).click()
+        self.expect(card).to_contain_text("重启程序后", timeout=30000)
+        fresh = self.context.new_page()
+        fresh.goto(self.base)
+        activate_owned_page(fresh)
+        fresh_card = fresh.get_by_role("region", name="业务备份与恢复", exact=True)
+        self.expect(fresh_card.get_by_role("button", name="取消恢复", exact=True)).to_be_enabled(timeout=30000)
+        fresh_card.get_by_role("button", name="取消恢复", exact=True).click()
+        # A no-Key fresh prepared host unmounts on ready and shows onboarding;
+        # cancellation success is durable state, not a notice in an unmounted card.
+        self.expect(fresh.get_by_role("button", name="暂不配置，查看本机资料", exact=True)).to_be_visible(timeout=30000)
+        self.assertEqual(server.request("/api/backup/state")[1]["mode"], "ready")
+
     """Real HTTP/backend and real browser; fakes only at external transports."""
     def setUp(self):
         from playwright.sync_api import expect
@@ -1051,6 +1157,7 @@ class RealServerTests(SafetyTests):
 
     def open_page(self, page):
         page.goto(self.base)
+        activate_owned_page(page)
         self.expect(page.get_by_role("button", name="暂不配置，查看本机资料", exact=True)).to_be_visible()
         page.get_by_role("button", name="暂不配置，查看本机资料", exact=True).click()
 
@@ -1087,6 +1194,7 @@ class RealServerTests(SafetyTests):
         self.assertEqual(self.owned.query("SELECT id FROM customer_followup_records"), [(5,)])
         self.assertEqual([c["id"] for c in server.request("/api/customers")[1]], ["customer-甲"])
         self.owned.assert_safety()
+        activate_owned_page(self.page)
         self.page.screenshot(path=str(OUTPUT / "real-stale-draft-375.png"))
         # A newly opened restored page retires old compose reference without GET.
         fresh = self.context.new_page()

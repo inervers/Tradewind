@@ -14,7 +14,9 @@ from .models import (BackupCancelled, BackupError, BackupLayout, BackupLimits,
                      BackupState, OperationView, PreparedRestore, RescueView,
                      RestoreOutcome, RestorePreview, ValidatedArchive)
 from .paths import BUSINESS_FILES, check_memory_path, owned_path, require_space
-from .restore import _read_recovery_state, _read_journal, cancel_prepared_restore, prepare_restore
+from .restore import (_read_recovery_state, _read_journal, _read_deletions,
+                      _publish_deletion, _deletion_path, _sync_directory,
+                      cancel_prepared_restore, prepare_restore)
 from .validation import validate_archive
 
 
@@ -153,17 +155,24 @@ class BackupService:
             if document and document["state"] == "prepared":
                 prepared = PreparedRestore(document["operation_id"], document["operation_id"], "prepared")
             rescues = []
+            deletions = _read_deletions(self.layout)
             root = owned_path(self.layout, "backups")
             if root.exists():
                 for folder in root.iterdir():
                     if not _id(folder.name):
                         raise _error()
+                    if folder.name in deletions:
+                        continue
                     archive = owned_path(self.layout, "backups/" + folder.name + "/rescue.zip")
                     journal = owned_path(self.layout, "backups/" + folder.name + "/recovery.json")
                     if archive.is_file() and journal.is_file():
                         control = _read_journal(self.layout, folder.name)
                         rescues.append(RescueView(folder.name, str(control["created_at"]), archive.stat().st_size,
                             control["state"] in {"prepared", "applying", "rolling_back"}))
+            for id, receipt in deletions.items():
+                archive = owned_path(self.layout, "backups/" + id + "/rescue.zip")
+                rescues.append(RescueView(id, str(receipt["journal"]["created_at"]),
+                                         archive.stat().st_size if archive.is_file() else 0, False))
             # Cheap, non-validating bootstrap: no DB constructors, photo traversal,
             # credentials, or strict business parsing. Estimates are optional.
             estimated = 0
@@ -297,6 +306,16 @@ class BackupService:
             if (not preview or source.view.status != "done" or preview.epoch != epoch
                     or epoch != current_epoch.epoch or preview.revision != revision
                     or preview.expires_at <= time.time()):
+                # Retire only a definitely obsolete completed source, never an
+                # invalid caller envelope or an active/uncertain prepare binding.
+                active = any(bound == preview_id and self._operations[op].view.status == "running"
+                             for bound, _, op in self._requests.values())
+                if (preview and source.view.status == "done" and self._preview == preview_id
+                        and not source.owners and not active and self.coordinator.mode == "ready"
+                        and (preview.epoch != current_epoch.epoch or preview.revision != revision
+                             or preview.expires_at <= time.time())):
+                    self._cleanup(source)
+                    source.view = replace(source.view, status="cancelled", preview=None)
                 raise _error("invalid_preview")
             lease = self.coordinator.reserve_exclusive("prepare")
             try:
@@ -346,6 +365,8 @@ class BackupService:
             if rescue:
                 if not _id(id):
                     raise _error("not_found")
+                if id in _read_deletions(self.layout):
+                    raise _error("not_found")
                 path = owned_path(self.layout, "backups/" + id + "/rescue.zip")
                 journal = owned_path(self.layout, "backups/" + id + "/recovery.json")
                 if not path.is_file() or not journal.is_file():
@@ -374,15 +395,20 @@ class BackupService:
             if not _id(id):
                 raise _error("not_found")
             folder = owned_path(self.layout, "backups/" + id)
-            if not (folder / "recovery.json").is_file():
-                raise _error("not_found")
-            _read_recovery_state(self.layout)
-            document = _read_journal(self.layout, id)
-            if (document["state"] in {"prepared", "applying", "rolling_back"}
-                    or self._rescue_owners.get(id) or self.coordinator.mode in {"prepare", "prepared"}):
+            recovery = _read_recovery_state(self.layout)
+            if ((recovery and recovery["state"] in {"prepared", "applying", "rolling_back"})
+                    or self._rescue_owners.get(id) or self.coordinator.mode in {"prepare", "prepared", "blocked"}):
                 raise _error("maintenance_busy")
+            receipt = _read_deletions(self.layout).get(id)
             try:
-                _remove_owned(folder, _identity(folder), tree=True)
+                if receipt is None:
+                    if not (folder / "recovery.json").is_file():
+                        raise _error("not_found")
+                    receipt = _publish_deletion(self.layout, id, _read_journal(self.layout, id))
+                _remove_owned(folder, tuple(receipt["directory_identity"]), tree=True)
+                marker = _deletion_path(self.layout, id)
+                _remove_owned(marker, _identity(marker))
+                _sync_directory(marker.parent)
             except OSError:
                 raise _error() from None
 

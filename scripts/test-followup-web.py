@@ -16,8 +16,9 @@ import sys
 import tempfile
 import time
 from datetime import date, timedelta
+from http.client import HTTPException
 import sqlite3
-from urllib.request import urlopen
+from urllib.request import build_opener, ProxyHandler
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,6 +47,7 @@ def fixture_server():
         env.update(TRADEWIND_DATA_DIR=directory, DEEPSEEK_API_KEY="synthetic-not-a-real-key",
                    TRADEWIND_NO_BROWSER="1", PYTHONIOENCODING="utf-8")
         base = f"http://127.0.0.1:{port}"
+        opener = build_opener(ProxyHandler({}))
         # Production intentionally trusts fixed UI ports. Add only this owned origin
         # in the isolated test process, without weakening the product's origin guard.
         bootstrap = (f"import server, uvicorn; server.LOCAL_UI_ORIGINS.add({base!r}); "
@@ -54,20 +56,26 @@ def fixture_server():
         def start():
             process = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.DEVNULL,
                                        stderr=subprocess.PIPE)
-            deadline = time.monotonic() + 60
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    _, stderr = process.communicate()
-                    raise RuntimeError("Isolated server exited before health check: " + stderr.decode("utf-8", errors="replace")[-2000:])
-                try:
-                    with urlopen(base + "/api/health", timeout=1) as response:
-                        if json.load(response)["service"] == "tradewind":
-                            return process
-                except OSError:
-                    time.sleep(0.1)
-            process.terminate()
-            _, stderr = process.communicate(timeout=10)
-            raise RuntimeError("Isolated server health timeout: " + stderr.decode("utf-8", errors="replace")[-2000:])
+            try:
+                deadline = time.monotonic() + 60
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        _, stderr = process.communicate()
+                        raise RuntimeError("Isolated server exited before health check: " + stderr.decode("utf-8", errors="replace")[-2000:])
+                    try:
+                        with opener.open(base + "/api/health", timeout=1) as response:
+                            if json.load(response)["service"] == "tradewind":
+                                return process
+                    except (OSError, HTTPException):
+                        # A transient malformed readiness response (including
+                        # loopback self-connect) is not product acceptance.
+                        time.sleep(0.1)
+                raise RuntimeError("Isolated server health timeout")
+            except BaseException:
+                if process.poll() is None:
+                    process.terminate()
+                process.communicate(timeout=10)
+                raise
         process = start()
         def restart():
             nonlocal process

@@ -19,6 +19,296 @@ from backup_helpers import make_business_fixture, make_archive, business_digest,
 
 
 class BackupAPITests(unittest.TestCase):
+    def cancelled_rescue(self, client):
+        view = self.preview(client)["preview"]
+        response = client.post("/api/backup/restore/prepare", json={
+            "preview_id": view["id"], "epoch": view["epoch"], "request_id": str(uuid.uuid4())})
+        prepared = self.wait(client, response.json()["id"])["prepared"]
+        client.server.backup_service.cancel_restore(prepared["operation_id"])
+        return prepared["rescue_id"]
+
+    def deletion_receipt(self, client, id):
+        # Fault below publication: real admission/receipt writer still execute.
+        with patch("app.backup.service._remove_owned", side_effect=PermissionError("synthetic lock")):
+            self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 422)
+        return self.layout.data_dir / ".backup-deletions" / (id + ".json")
+
+    def test_deletion_receipt_survives_removed_root_and_never_auto_deletes_on_startup(self):
+        from app.backup.service import BackupService
+        from app.backup.restore import apply_pending_restore
+        with open_fixture_server(self.layout) as client:
+            id = self.cancelled_rescue(client)
+            marker = self.deletion_receipt(client, id)
+            folder = self.layout.rescue_dir / id
+            before = business_digest(self.layout)
+            outcome = apply_pending_restore(self.layout, memory_path=self.layout.data_dir / "tradewind_memory.db", limits=BackupLimits())
+            self.assertEqual(outcome.status, "none")
+            self.assertTrue((folder / "rescue.zip").is_file())
+            self.assertEqual(business_digest(self.layout), before)
+            original_remove = __import__("app.backup.archive", fromlist=["_remove_owned"])._remove_owned
+            def marker_fault(path, identity, **kwargs):
+                if path == marker:
+                    raise PermissionError("synthetic final receipt lock")
+                return original_remove(path, identity, **kwargs)
+            with patch("app.backup.service._remove_owned", marker_fault):
+                self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 422)
+            self.assertFalse(folder.exists())
+            service = BackupService(self.layout, memory_path=self.layout.data_dir / "tradewind_memory.db",
+                app_version="synthetic", coordinator=MaintenanceCoordinator(self.layout), limits=BackupLimits())
+            rescues = service.state().rescues
+            self.assertEqual([(r.id, r.size_bytes) for r in rescues], [(id, 0)])
+            service.delete_rescue(id)
+            self.assertFalse(marker.exists())
+            self.assertEqual(business_digest(self.layout), before)
+
+    def test_deletion_receipt_corruption_scratch_and_conflicting_journal_fail_closed(self):
+        from app.backup.restore import apply_pending_restore
+        from app.backup.service import BackupService
+        with open_fixture_server(self.layout) as client:
+            id = self.cancelled_rescue(client)
+            marker = self.deletion_receipt(client, id)
+            original = marker.read_bytes()
+            document = json.loads(original)
+            variants = [b"{", original[:-1] + b',"format_version":1}', b"x" * (128 * 1024 + 1)]
+            for key, value in (("format_version", True), ("operation_id", str(uuid.uuid4())),
+                               ("directory_identity", [True, 1]), ("directory_identity", [0, 0])):
+                variants.append(json.dumps({**document, key: value}).encode())
+            variants.append(json.dumps({**document, "unexpected": "config.json"}).encode())
+            variants.append(json.dumps({**document, "journal": {**document["journal"], "state": "prepared"}}).encode())
+            before = business_digest(self.layout)
+            for raw in variants:
+                with self.subTest(raw=raw[:60]):
+                    marker.write_bytes(raw)
+                    self.assertEqual(client.get("/api/backup/state").status_code, 422)
+                    self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 422)
+                    self.assertEqual(apply_pending_restore(self.layout,
+                        memory_path=self.layout.data_dir / "tradewind_memory.db", limits=BackupLimits()).status, "blocked")
+                    with self.assertRaises(BackupError):
+                        BackupService(self.layout, memory_path=self.layout.data_dir / "tradewind_memory.db",
+                            app_version="synthetic", coordinator=MaintenanceCoordinator(self.layout), limits=BackupLimits())
+                    self.assertTrue((self.layout.rescue_dir / id / "rescue.zip").exists())
+                    self.assertEqual(business_digest(self.layout), before)
+            marker.write_bytes(original)
+            scratch = marker.with_suffix(".tmp")
+            scratch.write_bytes(original)
+            for published in (True, False):
+                if not published:
+                    marker.unlink()
+                self.assertEqual(client.get("/api/backup/state").status_code, 422)
+                self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 422)
+                self.assertTrue(scratch.exists())
+            scratch.unlink()
+            marker.write_bytes(original)
+            journal = self.layout.rescue_dir / id / "recovery.json"
+            saved = journal.read_bytes()
+            conflict = json.loads(saved)
+            for state in ("prepared", "cancelled"):
+                conflict.update(state=state, request_id="conflicting-request")
+                journal.write_text(json.dumps(conflict), encoding="utf-8")
+                self.assertEqual(client.get("/api/backup/state").status_code, 422)
+                self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 422)
+            journal.write_bytes(saved)
+            client.server.backup_service.delete_rescue(id)
+
+    def test_deletion_publication_failure_never_unlinks_and_scratch_is_not_authority(self):
+        import os
+        with open_fixture_server(self.layout) as client:
+            id = self.cancelled_rescue(client)
+            folder = self.layout.rescue_dir / id
+            zip_bytes = (folder / "rescue.zip").read_bytes()
+            replace = os.replace
+            def fail_publish(source, target):
+                if target.parent.name == ".backup-deletions":
+                    raise PermissionError("synthetic publication failure")
+                return replace(source, target)
+            with patch("app.backup.restore.os.replace", fail_publish):
+                self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 422)
+            self.assertEqual((folder / "rescue.zip").read_bytes(), zip_bytes)
+            self.assertTrue((folder / "recovery.json").exists())
+            self.assertEqual(client.get("/api/backup/state").status_code, 422)
+            self.assertTrue((self.layout.data_dir / ".backup-deletions" / (id + ".tmp")).is_file())
+
+    def test_deletion_refuses_foreign_uuid_group_substituted_root_and_junction(self):
+        import os
+        import subprocess
+        with open_fixture_server(self.layout) as client:
+            foreign_id = str(uuid.uuid4())
+            foreign = self.layout.rescue_dir / foreign_id
+            foreign.mkdir(parents=True)
+            sentinel = foreign / "foreign-private"
+            sentinel.write_bytes(b"never owned")
+            self.assertEqual(client.delete(f"/api/backup/rescues/{foreign_id}").status_code, 404)
+            id = self.cancelled_rescue(client)
+            marker = self.deletion_receipt(client, id)
+            folder = self.layout.rescue_dir / id
+            retained = self.root / "retained-owned-root"
+            folder.rename(retained)
+            folder.mkdir()
+            (folder / "foreign-private").write_bytes(b"substituted")
+            self.assertEqual(client.get("/api/backup/state").status_code, 422)
+            self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 422)
+            self.assertEqual((folder / "foreign-private").read_bytes(), b"substituted")
+            (folder / "foreign-private").unlink()
+            folder.rmdir()
+            if os.name == "nt":
+                result = subprocess.run(["cmd", "/c", "mklink", "/J", str(folder), str(foreign)], capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            else:
+                folder.symlink_to(foreign, target_is_directory=True)
+            try:
+                self.assertEqual(client.get("/api/backup/state").status_code, 422)
+                self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 422)
+                self.assertEqual(sentinel.read_bytes(), b"never owned")
+                self.assertTrue(marker.exists())
+            finally:
+                folder.rmdir() if os.name == "nt" else folder.unlink()
+                retained.rename(folder)
+            client.server.backup_service.delete_rescue(id)
+            self.assertEqual(sentinel.read_bytes(), b"never owned")
+
+    def test_deletion_active_download_and_unresolved_states_cannot_publish_receipt(self):
+        from app.backup.restore import _names
+        with open_fixture_server(self.layout) as client:
+            id = self.cancelled_rescue(client)
+            marker = self.layout.data_dir / ".backup-deletions" / (id + ".json")
+            with client.server.backup_service.download(id, rescue=True):
+                self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 503)
+            self.assertFalse(marker.exists())
+            journal = self.layout.rescue_dir / id / "recovery.json"
+            saved = journal.read_bytes()
+            document = json.loads(saved)
+            for state in ("prepared", "applying", "rolling_back"):
+                document["state"] = state
+                if state != "prepared":
+                    document["new_epoch"] = str(uuid.uuid4())
+                    document["entries"] = [{"name": name, "old": None,
+                        "new": "a" * 64 if name == ".data-epoch.json" else None, "phase": "queued"}
+                        for name in _names(document["includes_photos"])]
+                journal.write_text(json.dumps(document), encoding="utf-8")
+                self.assertEqual(client.delete(f"/api/backup/rescues/{id}").status_code, 503)
+                self.assertFalse(marker.exists())
+                self.assertTrue((journal.parent / "rescue.zip").exists())
+            journal.write_bytes(saved)
+
+
+    def test_actual_frontend_resources_reachable_but_business_gated_in_maintenance(self):
+        import re
+        with open_fixture_server(self.layout) as client:
+            html = client.get("/")
+            self.assertEqual(html.status_code, 200)
+            assets = ["/" + asset.removeprefix("./") for asset in
+                      re.findall(r'(?:src|href)="((?:\./|/)assets/[^" ]+)"', html.text)]
+            self.assertGreaterEqual(len(assets), 2)
+            for mode in ("snapshot", "prepare", "prepared"):
+                with self.subTest(mode=mode):
+                    lease = client.server.backup_coordinator.reserve_exclusive(mode if mode != "prepared" else "prepare")
+                    if mode == "prepared":
+                        client.server.backup_coordinator.hold_prepared("synthetic-static")
+                    try:
+                        for path in ("/", "/index.html", *assets):
+                            response = client.get(path)
+                            self.assertEqual(response.status_code, 200, path)
+                            self.assertTrue(response.content)
+                        for path in ("/api/customers", "/api/config", "/data/customers.json",
+                                     "/assets/no-such.js", "/arbitrary"):
+                            self.assertEqual(client.get(path).status_code, 503, path)
+                        self.assertEqual(client.post("/").status_code, 503)
+                    finally:
+                        if mode == "prepared":
+                            client.server.backup_coordinator.cancel_prepared("synthetic-static")
+                        lease.release()
+
+    def test_revision_invalid_preview_retires_real_slot_for_immediate_repreview(self):
+        with open_fixture_server(self.layout) as client:
+            first = self.preview(client)["preview"]
+            client.post("/api/customers", json={"name": "合成新资料"})
+            response = client.post("/api/backup/restore/prepare", json={
+                "preview_id": first["id"], "epoch": first["epoch"], "request_id": "obsolete"})
+            self.assertEqual((response.status_code, response.json()["code"]), (409, "invalid_preview"))
+            second = self.preview(client)["preview"]
+            self.assertNotEqual(second["id"], first["id"])
+            self.assertGreater(second["revision"], first["revision"])
+
+    def test_invalid_prepare_envelope_cannot_retire_valid_or_active_preview(self):
+        with open_fixture_server(self.layout) as client:
+            first = self.preview(client)["preview"]
+            service = client.server.backup_service
+            with self.assertRaises(BackupError) as error:
+                service.prepare(first["id"], str(uuid.uuid4()), "wrong-epoch")
+            self.assertEqual(error.exception.code, "invalid_preview")
+            self.assertEqual(service.operation(first["id"]).preview.id, first["id"])
+            started, release = threading.Event(), threading.Event()
+            real_prepare = __import__("app.backup.restore", fromlist=["prepare_restore"]).prepare_restore
+            def held(*args, **kwargs):
+                started.set()
+                if not release.wait(10):
+                    raise AssertionError("synthetic prepare release timed out")
+                return real_prepare(*args, **kwargs)
+            with patch("app.backup.service.prepare_restore", held):
+                operation = service.prepare(first["id"], first["epoch"], "active-request")
+                self.assertTrue(started.wait(5))
+                try:
+                    with self.assertRaises(BackupError):
+                        service.prepare(first["id"], str(uuid.uuid4()), "concurrent-invalid")
+                    self.assertEqual(service.operation(first["id"]).preview.id, first["id"])
+                    self.assertEqual(service.prepare(first["id"], first["epoch"], "active-request").id, operation.id)
+                finally:
+                    release.set()
+                prepared = self.wait(client, operation.id)["prepared"]
+            with self.assertRaises(BackupError):
+                service.prepare(first["id"], first["epoch"], "concurrent-after-durable")
+            self.assertEqual(service.state().prepared.operation_id, prepared["operation_id"])
+
+    def test_deletion_receipts_are_local_only_and_excluded_from_export(self):
+        import io
+        import zipfile
+        with open_fixture_server(self.layout) as client:
+            id = self.cancelled_rescue(client)
+            marker = self.deletion_receipt(client, id)
+            operation = client.post("/api/backup/export", json={"includes_photos": False}).json()["id"]
+            self.assertEqual(self.wait(client, operation)["status"], "done")
+            archive = client.get(f"/api/backup/operations/{operation}/download")
+            self.assertEqual(archive.status_code, 200)
+            with zipfile.ZipFile(io.BytesIO(archive.content)) as zipped:
+                self.assertFalse(any(".backup-deletions" in name or "backups/" in name for name in zipped.namelist()))
+            self.assertTrue(marker.exists())
+
+    def test_partial_rescue_delete_survives_zip_journal_loss_and_restart(self):
+        from app.backup.service import BackupService
+        from app.backup.restore import apply_pending_restore
+        with open_fixture_server(self.layout) as client:
+            id = self.cancelled_rescue(client)
+            folder = self.layout.rescue_dir / id
+            locked = folder / "original" / "locked-checkpoint"
+            locked.parent.mkdir(exist_ok=True)
+            locked.write_bytes(b"owned old unreviewed draft")
+            unrelated = self.layout.data_dir / "config.json"
+            unrelated.write_bytes(b'{"synthetic":"unchanged"}')
+            before = business_digest(self.layout), unrelated.read_bytes()
+            original_unlink = Path.unlink
+            def fail_child(path, *args, **kwargs):
+                if path == locked:
+                    raise PermissionError("synthetic locked child")
+                return original_unlink(path, *args, **kwargs)
+            with patch.object(Path, "unlink", fail_child):
+                response = client.delete(f"/api/backup/rescues/{id}")
+            self.assertEqual(response.status_code, 422)
+            self.assertFalse((folder / "rescue.zip").exists())
+            self.assertFalse((folder / "recovery.json").exists())
+            self.assertTrue(locked.exists())
+            outcome = apply_pending_restore(self.layout, memory_path=self.layout.data_dir / "tradewind_memory.db", limits=BackupLimits())
+            self.assertEqual(outcome.status, "none")
+            service = BackupService(self.layout, memory_path=self.layout.data_dir / "tradewind_memory.db",
+                                    app_version="synthetic", coordinator=MaintenanceCoordinator(self.layout), limits=BackupLimits())
+            self.assertEqual([r.id for r in service.state().rescues], [id])
+            with self.assertRaises(BackupError):
+                with service.download(id, rescue=True):
+                    self.fail("deleted material must not be downloadable")
+            service.delete_rescue(id)
+            self.assertFalse(folder.exists())
+            self.assertFalse((self.layout.data_dir / ".backup-deletions" / (id + ".json")).exists())
+            self.assertEqual((business_digest(self.layout), unrelated.read_bytes()), before)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="task6-api-")
         self.addCleanup(self.tmp.cleanup)
