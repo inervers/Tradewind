@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { api, backupDownloadUrl, BackupRequestError, checkBackupDownload } from "../api";
+import { api, backupDownloadUrl, backupErrorMessage, BackupRequestError, checkBackupDownload } from "../api";
 import { getDataSafetyState, subscribeDataSafety } from "../dataEpoch";
 import type { BackupCounts, BackupState, OperationView, RestorePreview } from "../types";
 import ConfirmDialog from "./ConfirmDialog";
 
 // Page-lifetime only. Settings may unmount; an upload/controller/request identity
-// must not. Never put ephemeral operation IDs in localStorage or bootstrap state.
+// must not. Never put ephemeral operation IDs in localStorage. A fresh page
+// can rediscover a completed preview from live service state, not persisted IDs.
 const session: {
   state: BackupState | null; operation: OperationView | null; preview: RestorePreview | null;
   pending: { previewId: string; epoch: string; requestId: string; rejected?: boolean } | null;
@@ -39,6 +40,15 @@ async function refresh(): Promise<void> {
     session.pending = null; session.preview = null; session.operation = null;
     session.error = "预览已失效，恢复未准备。请重新选择 ZIP 进行预览，或导出当前业务备份；已有草稿仍保留。";
   }
+  const recovered = next.current_preview;
+  if (next.mode === "ready" && !next.prepared && getDataSafetyState().mode === "ready"
+      && !session.busy && !session.upload && !session.pending && !session.operation && !session.preview
+      && recovered?.kind === "preview" && recovered.status === "done"
+      && recovered.preview?.epoch === next.epoch) {
+    session.operation = recovered;
+    session.preview = recovered.preview;
+    session.notice = "已找回后台保留的预览，资料尚未恢复。可继续核对、取消预览或更换 ZIP。";
+  }
   session.state = next;
   publish();
 }
@@ -55,7 +65,7 @@ async function releasePreview(): Promise<void> {
 function track(operation: OperationView): void {
   session.operation = operation;
   if (operation.preview) session.preview = operation.preview;
-  if (operation.status === "error") session.error = safeError;
+  if (operation.status === "error") session.error = backupErrorMessage(operation.code);
   publish();
   if (operationTimer !== null) window.clearTimeout(operationTimer);
   operationTimer = null;
@@ -77,7 +87,7 @@ function track(operation: OperationView): void {
 async function act(action: () => Promise<void>): Promise<void> {
   if (session.busy) return;
   session.busy = true; session.error = ""; session.notice = ""; publish();
-  try { await action(); } catch { session.error = safeError; }
+  try { await action(); } catch (error) { session.error = error instanceof BackupRequestError ? error.message : safeError; }
   finally { session.busy = false; publish(); }
 }
 
@@ -171,7 +181,8 @@ export default function BackupSettingsCard(): JSX.Element {
           session.uploaded = loaded; session.uploadTotal = total; publish();
         }));
       } catch (error) {
-        session.error = error instanceof DOMException && error.name === "AbortError" ? "上传已取消，资料未恢复。请刷新状态后再选择文件。" : safeError;
+        session.error = error instanceof DOMException && error.name === "AbortError" ? "上传已取消，资料未恢复。请刷新状态后再选择文件。"
+          : error instanceof BackupRequestError ? error.message : safeError;
       } finally { session.upload = null; publish(); await refresh(); }
     });
   };
@@ -244,6 +255,11 @@ export default function BackupSettingsCard(): JSX.Element {
       </tbody></table>
       <p>{preview.backup.includes_photos ? "包含照片：替换当前照片与照片扫描结果。" : "不含照片：保留当前照片与照片扫描结果。"}</p>
       <button className="btn btn-danger" disabled={!ready || busy || !!pending || !!running || !!upload} onClick={() => { setWord(""); setConfirm(true); }}>准备恢复</button>
+      <button className="btn btn-ghost" disabled={locked} onClick={() => void act(async () => {
+        await releasePreview(); session.operation = null;
+        session.notice = "预览已取消，业务资料未恢复；救援备份仍保留。";
+        await refresh();
+      })}>取消预览</button>
     </div>}
     {pending && !busy && !running && (operation?.kind !== "prepare" || operation.status === "error") && <button className="btn btn-ghost" disabled={safety.mode === "stale"} onClick={() => void prepare()}>重试准备恢复</button>}
     {prepared && <div className="backup-prepared" role="status">

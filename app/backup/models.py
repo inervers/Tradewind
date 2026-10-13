@@ -143,3 +143,4 @@ class BackupState:
     report: RestoreOutcome
     estimated_bytes: int
     photo_count: int
+    current_preview: OperationView | None = None

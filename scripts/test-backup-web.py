@@ -812,6 +812,35 @@ class UITests(SafetyTests):
         aborted = self.page.evaluate("async () => {const c=new AbortController(); c.abort(); try {await api.backup.startPreview(new File(['x'],'x.zip'),c.signal)} catch(e) {return e.name}}")
         self.assertEqual(aborted, "AbortError")
 
+    def test_backup_http_error_codes_are_whitelisted_for_fetch_and_raw_upload(self):
+        self.harness()
+        # External transport faults are controlled; real API/XHR parsing is not mocked.
+        for transport, path in (("fetch", "export"), ("xhr", "preview")):
+            for status, code, explanation in ((503, "maintenance_busy", "已有预览"),
+                    (507, "insufficient_space", "磁盘空间不足"),
+                    (409, "invalid_preview", "预览已失效"),
+                    (500, "invalid_preview", "未确认成功"),
+                    (409, "invalid_preview_extra", "未确认成功")):
+                with self.subTest(transport=transport, status=status, code=code):
+                    def failure(route):
+                        route.fulfill(status=status, json={"code": code, "detail": "private/API_KEY/path/stack"})
+                    url = "**/api/backup/" + path
+                    self.page.route(url, failure)
+                    try:
+                        result = self.page.evaluate("""async (transport) => {
+                          try {
+                            if (transport === 'fetch') await api.backup.startExport(false);
+                            else await api.backup.startPreview(new File(['x'], 'x.zip'), new AbortController().signal);
+                          } catch (e) { return {code:e.code, message:e.message}; }
+                        }""", transport)
+                        self.assertIn(explanation, result["message"])
+                        self.assertNotIn("private", result["message"])
+                        self.assertNotIn("API_KEY", result["message"])
+                        self.assertEqual(result["code"], code if code in {"maintenance_busy", "insufficient_space"}
+                                         or (code == "invalid_preview" and status == 409) else None)
+                    finally:
+                        self.page.unroute(url, failure)
+
     def test_prepared_host_preserves_mounted_copyable_draft(self):
         self.panel()
         field = self.page.get_by_label("沟通内容", exact=True)
@@ -1088,6 +1117,47 @@ class UITests(SafetyTests):
 
 
 class RealServerTests(SafetyTests):
+    def test_real_preview_reload_recover_replace_and_explicit_cancel(self):
+        from backup_helpers import business_digest
+        server = self.owned.server
+        before = business_digest(self.owned.layout)
+        archive = server.export(False)
+        card = self.settings(self.page)
+        self.page.get_by_label("选择业务备份 ZIP", exact=True).set_input_files(
+            {"name": "first.zip", "mimeType": "application/zip", "buffer": archive})
+        self.expect(card.get_by_role("button", name="准备恢复", exact=True)).to_be_enabled(timeout=30000)
+        first = server.request("/api/backup/state")[1].get("current_preview")
+        self.page.reload()
+        activate_owned_page(self.page)
+        self.page.get_by_role("button", name="暂不配置，查看本机资料", exact=True).click()
+        self.page.get_by_role("button", name="设置", exact=True).click()
+        self.expect(card.get_by_role("button", name="准备恢复", exact=True)).to_be_enabled(timeout=10000)
+        self.assertIsNotNone(first)
+        self.expect(card).to_contain_text("已找回")
+        self.page.get_by_label("选择业务备份 ZIP", exact=True).set_input_files(
+            {"name": "replacement.zip", "mimeType": "application/zip", "buffer": archive})
+        self.expect(card.get_by_role("button", name="准备恢复", exact=True)).to_be_enabled(timeout=30000)
+        second = server.request("/api/backup/state")[1]["current_preview"]
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual(server.request(f"/api/backup/operations/{first['id']}")[1]["status"], "cancelled")
+        fresh = self.context.new_page()
+        fresh_card = self.settings(fresh)
+        self.expect(fresh_card.get_by_role("button", name="准备恢复", exact=True)).to_be_enabled(timeout=30000)
+        fresh_card.get_by_role("button", name="取消预览", exact=True).click()
+        self.expect(fresh_card.get_by_role("button", name="准备恢复", exact=True)).to_have_count(0)
+        self.assertIsNone(server.request("/api/backup/state")[1]["current_preview"])
+        self.assertEqual(server.request("/api/backup/state")[1]["rescues"], [])
+        self.assertEqual(business_digest(self.owned.layout), before)
+
+    def test_real_invalid_zip_explains_format_error_without_raw_exception(self):
+        card = self.settings(self.page)
+        self.page.get_by_label("选择业务备份 ZIP", exact=True).set_input_files(
+            {"name": "invalid.zip", "mimeType": "application/zip", "buffer": b"not a business archive"})
+        self.expect(card.get_by_role("alert")).to_contain_text("业务备份格式", timeout=30000)
+        self.expect(card.get_by_role("alert")).not_to_contain_text("Traceback")
+        self.expect(card.get_by_role("button", name="准备恢复", exact=True)).to_have_count(0)
+        self.assertEqual(self.owned.server.request("/api/backup/state")[1]["rescues"], [])
+
     def test_real_replacement_revision_repreview_and_fresh_prepared_cancel(self):
         server = self.owned.server
         archive = server.export(False)

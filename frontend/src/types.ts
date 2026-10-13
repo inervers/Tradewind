@@ -33,6 +33,7 @@ export interface BackupState {
   epoch: string; require_header: boolean; revision: number;
   prepared: PreparedRestore | null; rescues: RescueView[]; report: RestoreOutcome;
   estimated_bytes: number; photo_count: number;
+  current_preview?: OperationView | null;
 }
 
 export interface Product {

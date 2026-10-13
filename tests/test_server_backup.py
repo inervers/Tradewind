@@ -19,6 +19,55 @@ from backup_helpers import make_business_fixture, make_archive, business_digest,
 
 
 class BackupAPITests(unittest.TestCase):
+    def test_state_recovers_completed_preview_and_cancel_releases_single_slot(self):
+        with open_fixture_server(self.layout) as client:
+            before = business_digest(self.layout)
+            self.assertIsNone(client.get("/api/backup/state").json().get("current_preview"))
+            first = self.preview(client)
+            recovered = client.get("/api/backup/state").json().get("current_preview")
+            self.assertIsNotNone(recovered, "a fresh page must discover the retained completed preview")
+            self.assertEqual(recovered["id"], first["id"])
+            self.assertEqual(recovered["preview"], first["preview"])
+            blocked = client.post("/api/backup/preview", content=self.zip.read_bytes(),
+                                  headers={"Content-Type": "application/zip"})
+            self.assertEqual((blocked.status_code, blocked.json()["code"]), (503, "maintenance_busy"))
+            self.assertEqual(client.post(f"/api/backup/operations/{recovered['id']}/cancel").status_code, 200)
+            self.assertIsNone(client.get("/api/backup/state").json().get("current_preview"))
+            second = self.preview(client)
+            self.assertNotEqual(second["id"], first["id"])
+            self.assertEqual(business_digest(self.layout), before)
+
+    def test_state_never_offers_uploading_or_active_prepare_as_recoverable_preview(self):
+        with open_fixture_server(self.layout) as client:
+            service = client.server.backup_service
+            ticket = service.begin_upload()
+            try:
+                self.assertIsNone(client.get("/api/backup/state").json().get("current_preview"))
+            finally:
+                ticket.abort()
+            preview = self.preview(client)["preview"]
+            entered, release = threading.Event(), threading.Event()
+            original = __import__("app.backup.restore", fromlist=["prepare_restore"]).prepare_restore
+            def held(*args, **kwargs):
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("synthetic prepare was not released")
+                return original(*args, **kwargs)
+            with patch("app.backup.service.prepare_restore", held):
+                operation = service.prepare(preview["id"], preview["epoch"], "recover-active-guard")
+                try:
+                    self.assertTrue(entered.wait(5))
+                    state = client.get("/api/backup/state").json()
+                    self.assertEqual(state["mode"], "prepare")
+                    self.assertIsNone(state.get("current_preview"))
+                    self.assertEqual(client.post(f"/api/backup/operations/{preview['id']}/cancel").status_code, 503)
+                finally:
+                    release.set()
+                self.wait(client, operation.id)
+            state = client.get("/api/backup/state").json()
+            self.assertEqual(state["mode"], "prepared")
+            self.assertIsNone(state.get("current_preview"))
+
     def cancelled_rescue(self, client):
         view = self.preview(client)["preview"]
         response = client.post("/api/backup/restore/prepare", json={

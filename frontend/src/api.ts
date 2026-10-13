@@ -10,10 +10,33 @@ import { getDataSafetyState, getPageEpoch, initializeDataEpoch, markDataMaintena
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 
-/** Preserve only a definite safe control code, never server exception text. */
+// Closed local explanations only: never render server exception text/paths.
+const backupErrors = {
+  invalid_preview: "恢复预览已失效，请重新选择业务备份 ZIP 进行预览。",
+  maintenance_busy: "业务请求、已有预览或备份维护尚未结束。请刷新备份状态；找回旧预览后可取消或更换 ZIP。救援备份不会自动删除。",
+  invalid_backup: "ZIP 损坏或不符合业务备份格式，请选择设置页导出的业务备份 ZIP。",
+  invalid_json: "备份中的业务资料格式无效，请重新导出业务备份或使用兼容版本。",
+  invalid_database: "备份中的数据库损坏或业务数据无效，请重新导出业务备份。",
+  unsupported_schema: "备份数据库结构不受本版本支持，请使用兼容版本。",
+  unsupported_version: "备份格式版本不受本版本支持，请使用兼容版本。",
+  resource_limit: "备份超过本版本允许的大小或文件数量上限，请缩小输入后重试。",
+  insufficient_space: "本机磁盘空间不足，请保留备份所需空间及安全余量后重试。",
+  not_found: "备份操作或材料已不存在，可能已到期或被取消。请刷新状态或重新选择 ZIP。",
+} as const;
+type BackupCode = keyof typeof backupErrors;
+export function backupErrorMessage(code: unknown): string {
+  return typeof code === "string" && Object.prototype.hasOwnProperty.call(backupErrors, code)
+    ? backupErrors[code as BackupCode] : "操作未确认成功。请刷新状态或重试；救援备份不会自动删除。";
+}
+
+/** Only a definite HTTP 409 invalid_preview may retire a prepare identity. */
 export class BackupRequestError extends Error {
-  constructor(readonly code: "invalid_preview" | null = null) {
-    super("备份操作未确认成功，请刷新状态或重试。");
+  readonly code: BackupCode | null;
+  constructor(code: unknown = null, status?: number) {
+    const safeCode = typeof code === "string" && Object.prototype.hasOwnProperty.call(backupErrors, code)
+      && (code !== "invalid_preview" || status === 409) ? code as BackupCode : null;
+    super(backupErrorMessage(safeCode));
+    this.code = safeCode;
   }
 }
 
@@ -37,15 +60,15 @@ async function req<T>(url: string, opts?: RequestInit): Promise<T> {
   const resp = await fetch(apiUrl(url), { ...opts, headers: mergedHeaders });
   if (!resp.ok) {
     let detail = "";
-    let backupCode: "invalid_preview" | null = null;
+    let backupCode: unknown = null;
     try {
       const j = await resp.json();
       detail = j.detail || j.error || "";
       if (resp.status === 409 && j.code === "stale_epoch") markDataStale();
       if (resp.status === 503 && j.code === "maintenance_busy") markDataMaintenance();
-      if (control && resp.status === 409 && j.code === "invalid_preview") backupCode = "invalid_preview";
+      if (control) backupCode = j.code;
     } catch { /* ignore */ }
-    if (control) throw new BackupRequestError(backupCode);
+    if (control) throw new BackupRequestError(backupCode, resp.status);
     throw new Error(detail || `请求失败（${resp.status}）`);
   }
   const result = await resp.json() as T;
@@ -116,7 +139,7 @@ async function uploadBackupFile(file: File, signal: AbortSignal, progress?: (loa
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const cleanup = () => signal.removeEventListener("abort", abort);
-    const fail = () => { cleanup(); reject(new Error("备份上传未确认成功，请刷新状态或重新选择文件。")); };
+    const fail = () => { cleanup(); reject(new BackupRequestError()); };
     const abort = () => xhr.abort();
     xhr.open("POST", apiUrl("/api/backup/preview"));
     xhr.setRequestHeader("Content-Type", "application/zip");
@@ -133,7 +156,7 @@ async function uploadBackupFile(file: File, signal: AbortSignal, progress?: (loa
       if (xhr.status < 200 || xhr.status >= 300) {
         if (payload.code === "stale_epoch") markDataStale();
         if (payload.code === "maintenance_busy") markDataMaintenance();
-        fail(); return;
+        reject(new BackupRequestError(payload.code, xhr.status)); return;
       }
       resolve(payload as OperationView);
     };

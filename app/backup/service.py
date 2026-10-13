@@ -183,8 +183,17 @@ class BackupService:
                         estimated += path.stat().st_size
                 except (OSError, BackupError):
                     pass
-            return BackupState(self.coordinator.mode, epoch.epoch, epoch.require_header, revision,
-                               prepared, rescues, self._report, estimated, self._photo_estimate)
+            mode = self.coordinator.mode
+            source = self._operations.get(self._preview)
+            # Recover page-lost identity without granting ownership or relaxing
+            # the single slot. Uploads and active preparations are not reusable.
+            current_preview = (source.view if mode == "ready" and prepared is None
+                               and source is not None and not source.owners
+                               and source.view.status == "done" and source.view.preview is not None
+                               and source.view.preview.epoch == epoch.epoch else None)
+            return BackupState(mode, epoch.epoch, epoch.require_header, revision,
+                               prepared, rescues, self._report, estimated, self._photo_estimate,
+                               current_preview)
 
     def start_export(self, includes_photos: bool) -> OperationView:
         if type(includes_photos) is not bool:
@@ -246,7 +255,7 @@ class BackupService:
             item = self._operations.get(id)
             if item is None:
                 raise _error("not_found")
-            if item.owners or item.view.kind == "prepare" or self.coordinator.mode == "prepared":
+            if item.owners or item.view.kind == "prepare" or self.coordinator.mode in {"prepare", "prepared"}:
                 raise _error("maintenance_busy")
             item.cancel.set()
             if item.upload is not None:
